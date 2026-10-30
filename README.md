@@ -1,9 +1,10 @@
-# LV2-haiku
+# LV2-renku
 
-> **Users:** install the whole stack from the [JackDAW release](https://github.com/rations/jackDAW-haiku/releases)
-> (`sh install.sh`). This repository is the source of the `lv2_haiku` package.
+> This repository is the source of the `lv2_haiku` package, part of the
+> [JackDAW stack](https://github.com/rations/jackDAW-renku) for RenkuOS. The 0.5
+> release's `install.sh` is for Haiku hrev60256; there is no RenkuOS release yet.
 
-Native port of the **LV2 plugin hosting stack** to **Haiku OS**.
+Native port of the **LV2 plugin hosting stack** to **RenkuOS** (a Haiku fork).
 
 This repo vendors the upstream drobilla suite pristine under `lv2stack/` — the
 [LV2](https://lv2plug.in) specification 1.18.11, zix 0.8.1, serd 0.32.10, sord 0.16.22,
@@ -11,21 +12,21 @@ sratom 0.6.22, and lilv 0.28.0 — and builds it natively as static libraries wi
 project's own unmodified meson build. On top of that it adds:
 
 - **`hosts/lv2jackhost`** — a headless JACK host with a stdin parameter REPL, for running
-  and validating LV2 plugins live on Haiku hardware.
+  and validating LV2 plugins live on RenkuOS hardware.
 - **`hosts/lv2guihost`** — a native Interface Kit test host for LV2 plugin GUIs.
 - **`ns/ui-haiku.lv2`** — a small LV2 extension bundle defining the **HaikuUI** UI type:
   a plugin UI whose `LV2UI_Widget` is a native `BView*`, exactly parallel to the spec's
-  CocoaUI (`NSView*`). Plugins built for Haiku can ship native Interface Kit editors;
+  CocoaUI (`NSView*`). Plugins built for RenkuOS can ship native Interface Kit editors;
   `ui:showInterface` (UI owns its own `BWindow`) is supported as well.
 - **`plugins/hkamp.lv2`** — a simple stereo amplifier plugin (with a native BView UI) used
   as the milestone test plugin.
 
 Plugins install to `/boot/home/config/non-packaged/add-ons/media/LV2/` (user) or
 `/boot/system/non-packaged/add-ons/media/LV2/` (system); the default `LV2_PATH` covers those
-plus `/boot/system/add-ons/media/LV2`. No dot-folders — Haiku organises per-user files under
+plus `/boot/system/add-ons/media/LV2`. No dot-folders — RenkuOS organises per-user files under
 the `~/config` hierarchy.
 
-## Building (on Haiku)
+## Building (on RenkuOS)
 
 ```sh
 make deps       # pkgman install -y meson ninja pkgconfig
