@@ -752,42 +752,84 @@ static size_t card_prefix_len(const char *name)
     return sep ? (size_t)(sep - name) : 0;
 }
 
-void lv2host_autoconnect(Lv2Host *h)
+/* The clock card's name ("media:<card>") from the playback jacks, "" if they
+   have none (JACK). */
+static void clock_card(Lv2Host *h, char *card, size_t len)
+{
+    card[0] = '\0';
+    const char **play = h->be->get_ports(JD_PORT_AUDIO, JD_PORT_INPUT | JD_PORT_PHYSICAL);
+    if (!play) {
+        return;
+    }
+    size_t n = play[0] ? card_prefix_len(play[0]) : 0;
+    if (n > 0 && n < len) {
+        memcpy(card, play[0], n);
+        card[n] = '\0';
+    }
+    h->be->free_ports(play);
+}
+
+/* Index of the first hardware capture jack to use: the clock card's first,
+   else 0. A card on another clock reaches us resampled and steered, and its
+   input runs dry now and then. */
+static int first_capture(Lv2Host *h, const char **cap)
+{
+    char card[256];
+    clock_card(h, card, sizeof card);
+    if (card[0]) {
+        size_t n = strlen(card);
+        for (int i = 0; cap[i]; i++) {
+            if (card_prefix_len(cap[i]) == n && !strncmp(cap[i], card, n)) {
+                return i;
+            }
+        }
+    }
+    return 0;
+}
+
+void lv2host_connect_outputs(Lv2Host *h)
 {
     if (!h->be) {
         return;
     }
-    /* Outputs to the playback jacks (on the Media Kit those of the card that
-       runs the clock; out_1/out_2 are wired there already, which counts as
-       ok). */
-    char card[256] = "";
+    /* On the Media Kit out_1/out_2 are wired to the clock card already,
+       which counts as ok. */
     const char **play = h->be->get_ports(JD_PORT_AUDIO, JD_PORT_INPUT | JD_PORT_PHYSICAL);
     if (play) {
-        size_t n = play[0] ? card_prefix_len(play[0]) : 0;
-        if (n > 0 && n < sizeof card) {
-            memcpy(card, play[0], n);
-            card[n] = '\0';
-        }
         for (int i = 0; i < 2 && play[i]; i++) {
             (void)h->be->connect(h->be->port_name(h->pout[i]), play[i]);
         }
         h->be->free_ports(play);
     }
-    /* Inputs from that same card's capture jacks when it has any: a card on
-       another clock reaches us resampled and steered, and its input runs dry
-       now and then. Otherwise the first capture jacks, as before. */
+}
+
+bool lv2host_default_source(Lv2Host *h, char *out, size_t len)
+{
+    out[0] = '\0';
+    if (!h->be) {
+        return false;
+    }
+    const char **cap = h->be->get_ports(JD_PORT_AUDIO, JD_PORT_OUTPUT | JD_PORT_PHYSICAL);
+    if (!cap || !cap[0]) {
+        if (cap) {
+            h->be->free_ports(cap);
+        }
+        return false;
+    }
+    snprintf(out, len, "%s", cap[first_capture(h, cap)]);
+    h->be->free_ports(cap);
+    return out[0] != '\0';
+}
+
+void lv2host_autoconnect(Lv2Host *h)
+{
+    if (!h->be) {
+        return;
+    }
+    lv2host_connect_outputs(h);
     const char **cap = h->be->get_ports(JD_PORT_AUDIO, JD_PORT_OUTPUT | JD_PORT_PHYSICAL);
     if (cap) {
-        int first = 0;
-        if (card[0]) {
-            for (int i = 0; cap[i]; i++) {
-                if (card_prefix_len(cap[i]) == strlen(card) &&
-                    !strncmp(cap[i], card, strlen(card))) {
-                    first = i;
-                    break;
-                }
-            }
-        }
+        int first = first_capture(h, cap);
         for (int i = 0; i < 2 && cap[first + i]; i++) {
             (void)h->be->connect(cap[first + i], h->be->port_name(h->pin[i]));
         }

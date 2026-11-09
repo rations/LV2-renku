@@ -37,6 +37,7 @@
 #include "engine/audio_backend.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -153,8 +154,17 @@ bool lv2host_open(Lv2Host *h, const char *plugin_uri, const char *client_name,
    stop workers, free everything. Non-RT. */
 void lv2host_close(Lv2Host *h);
 
-/* Best effort: wire our stereo ports to the physical capture/playback. */
+/* Best effort: wire our stereo ports to the physical capture/playback. The
+   inputs come from the card that runs the clock when it has capture jacks
+   (on the Media Kit), else from the first capture jacks. */
 void lv2host_autoconnect(Lv2Host *h);
+
+/* Best effort: only out_1/out_2 to the physical playback. */
+void lv2host_connect_outputs(Lv2Host *h);
+
+/* The capture jack lv2host_autoconnect would connect to in_1, written to
+   out; false (out "") if there is none. Non-RT. */
+bool lv2host_default_source(Lv2Host *h, char *out, size_t len);
 
 /* The audio sources in_1/in_2 can be connected from (hardware capture
    first; on the Media Kit also other programs' outputs), NULL-terminated,
