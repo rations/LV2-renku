@@ -14,10 +14,29 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Flush-to-zero / denormals-are-zero. JACK does not set FTZ/DAZ on a client's
-   process thread, so plugins whose filter/reverb feedback paths produce
-   subnormal floats stall the CPU and blow the RT deadline; re-arm it in every
-   callback (a plugin may clear MXCSR itself). Two register writes — cheap. */
+/* An error for the user: the first one is kept in h->error (a GUI shows it),
+   and every one also goes to stderr. Non-RT only. */
+static void host_err(Lv2Host *h, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    if (!h->error[0]) {
+        va_list ap2;
+        va_copy(ap2, ap);
+        vsnprintf(h->error, sizeof h->error, fmt, ap2);
+        va_end(ap2);
+    }
+    fprintf(stderr, "error: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+}
+
+/* Flush-to-zero / denormals-are-zero. The process thread cannot be relied on
+   to have FTZ/DAZ set (JACK does not set it on a client's thread), and plugins
+   whose filter/reverb feedback paths produce subnormal floats stall the CPU
+   and blow the RT deadline; re-arm it in every callback (a plugin may clear
+   MXCSR itself). Two register writes — cheap. */
 #if defined(__SSE__) || defined(__x86_64__)
 #include <pmmintrin.h>
 #include <xmmintrin.h>
@@ -298,7 +317,7 @@ static bool feature_supported(const char *uri)
     return false;
 }
 
-static bool check_required_features(const LilvPlugin *p)
+static bool check_required_features(Lv2Host *h, const LilvPlugin *p)
 {
     bool ok = true;
     LilvNodes *req = lilv_plugin_get_required_features(p);
@@ -308,8 +327,8 @@ static bool check_required_features(const LilvPlugin *p)
             const LilvNode *f = lilv_nodes_get(req, it);
             const char *uri = lilv_node_as_uri(f);
             if (!uri || !feature_supported(uri)) {
-                fprintf(stderr, "error: plugin requires unsupported feature %s\n",
-                        uri ? uri : "(?)");
+                host_err(h, "the plug-in requires a feature this host lacks: %s",
+                         uri ? uri : "(?)");
                 ok = false;
             }
         }
@@ -320,11 +339,27 @@ static bool check_required_features(const LilvPlugin *p)
 
 /* ---- RT path ---- */
 
-/* JACK xrun callback: count only — never log from a JACK callback thread. */
-static int xrun_cb(void *arg)
+/* Backend callbacks other than process: count or flag only — never log or
+   allocate from a backend's callback thread. */
+static void xrun_cb(void *arg)
 {
     Lv2Host *h = (Lv2Host *)arg;
     h->n_xruns++;
+}
+
+static void shutdown_cb(void *arg)
+{
+    Lv2Host *h = (Lv2Host *)arg;
+    h->backend_gone = 1;
+}
+
+/* The period changed (the Media Kit follows the card's buffer size). Buffers
+   are sized for the longest period up front, so nothing to do; a longer one
+   than that is flagged by process_cb. */
+static int buffer_size_cb(jd_nframes_t nframes, void *arg)
+{
+    (void)nframes;
+    (void)arg;
     return 0;
 }
 
@@ -419,16 +454,16 @@ static void host_run(Lv2Host *h, float *L, float *R, uint32_t n)
     }
 }
 
-static int process_cb(jack_nframes_t nframes, void *arg)
+static int process_cb(jd_nframes_t nframes, void *arg)
 {
     Lv2Host *h = (Lv2Host *)arg;
     rt_set_denormal_mode();
     apply_ctl_writes(h);
 
-    const float *inL = (const float *)jack_port_get_buffer(h->jin[0], nframes);
-    const float *inR = (const float *)jack_port_get_buffer(h->jin[1], nframes);
-    float *outL = (float *)jack_port_get_buffer(h->jout[0], nframes);
-    float *outR = (float *)jack_port_get_buffer(h->jout[1], nframes);
+    const float *inL = (const float *)h->be->port_buffer(h->pin[0], nframes);
+    const float *inR = (const float *)h->be->port_buffer(h->pin[1], nframes);
+    float *outL = (float *)h->be->port_buffer(h->pout[0], nframes);
+    float *outR = (float *)h->be->port_buffer(h->pout[1], nframes);
 
     if (nframes > h->max_block) { /* buffer grew beyond what we pre-allocated */
         h->block_too_big = 1;
@@ -440,8 +475,13 @@ static int process_cb(jack_nframes_t nframes, void *arg)
     memcpy(h->bufL, inL, (size_t)nframes * sizeof(float));
     memcpy(h->bufR, inR, (size_t)nframes * sizeof(float));
     host_run(h, h->bufL, h->bufR, nframes);
-    memcpy(outL, h->bufL, (size_t)nframes * sizeof(float));
-    memcpy(outR, h->bufR, (size_t)nframes * sizeof(float));
+    if (h->passthrough) {
+        memcpy(outL, h->bufL, (size_t)nframes * sizeof(float));
+        memcpy(outR, h->bufR, (size_t)nframes * sizeof(float));
+    } else {
+        memset(outL, 0, (size_t)nframes * sizeof(float));
+        memset(outR, 0, (size_t)nframes * sizeof(float));
+    }
     return 0;
 }
 
@@ -486,7 +526,7 @@ static bool host_instantiate(Lv2Host *h, double sr)
     if (!h->ctl || !h->ain || !h->aout || !h->params || !h->outs || !h->atoms || !h->bufL ||
         !h->bufR || !h->outA || !h->outB || !h->dummy_in || !h->dummy_out || !h->misc ||
         !h->ctl_ring || !mins || !maxs || !defs) {
-        fprintf(stderr, "error: out of memory\n");
+        host_err(h, "out of memory");
         goto done;
     }
     if (zix_ring_mlock(h->ctl_ring) != ZIX_STATUS_SUCCESS) {
@@ -498,7 +538,7 @@ static bool host_instantiate(Lv2Host *h, double sr)
     for (uint32_t i = 0; i < h->n_ports; i++) {
         const LilvPort *port = lilv_plugin_get_port_by_index(p, i);
         if (!port) {
-            fprintf(stderr, "error: port %u missing\n", i);
+            host_err(h, "the plug-in's port %u is missing", i);
             goto done;
         }
         bool is_in = lilv_port_is_a(p, port, n_input);
@@ -614,13 +654,13 @@ static bool host_instantiate(Lv2Host *h, double sr)
 
         h->inst[k] = lilv_plugin_instantiate(p, sr, h->features[k]);
         if (!h->inst[k]) {
-            fprintf(stderr, "error: lilv_plugin_instantiate failed\n");
+            host_err(h, "the plug-in could not be instantiated");
             goto done;
         }
         for (uint32_t a = 0; a < h->n_atoms; a++) {
             h->atoms[a].buf[k] = calloc(1, sizeof(LV2_Atom_Sequence) + h->atoms[a].capacity);
             if (!h->atoms[a].buf[k]) {
-                fprintf(stderr, "error: out of memory\n");
+                host_err(h, "out of memory");
                 goto done;
             }
         }
@@ -704,24 +744,98 @@ static void host_destroy(Lv2Host *h)
     free(h->misc);
 }
 
+/* The card part of a Media Kit jack name, "media:<card> / <jack>": its
+   length up to " / ", or 0 for a name without one (JACK's "system:..."). */
+static size_t card_prefix_len(const char *name)
+{
+    const char *sep = strstr(name, " / ");
+    return sep ? (size_t)(sep - name) : 0;
+}
+
 void lv2host_autoconnect(Lv2Host *h)
 {
-    const char **play = jack_get_ports(h->client, NULL, JACK_DEFAULT_AUDIO_TYPE,
-                                       JackPortIsPhysical | JackPortIsInput);
+    if (!h->be) {
+        return;
+    }
+    /* Outputs to the playback jacks (on the Media Kit those of the card that
+       runs the clock; out_1/out_2 are wired there already, which counts as
+       ok). */
+    char card[256] = "";
+    const char **play = h->be->get_ports(JD_PORT_AUDIO, JD_PORT_INPUT | JD_PORT_PHYSICAL);
     if (play) {
+        size_t n = play[0] ? card_prefix_len(play[0]) : 0;
+        if (n > 0 && n < sizeof card) {
+            memcpy(card, play[0], n);
+            card[n] = '\0';
+        }
         for (int i = 0; i < 2 && play[i]; i++) {
-            jack_connect(h->client, jack_port_name(h->jout[i]), play[i]);
+            (void)h->be->connect(h->be->port_name(h->pout[i]), play[i]);
         }
-        jack_free(play);
+        h->be->free_ports(play);
     }
-    const char **cap = jack_get_ports(h->client, NULL, JACK_DEFAULT_AUDIO_TYPE,
-                                      JackPortIsPhysical | JackPortIsOutput);
+    /* Inputs from that same card's capture jacks when it has any: a card on
+       another clock reaches us resampled and steered, and its input runs dry
+       now and then. Otherwise the first capture jacks, as before. */
+    const char **cap = h->be->get_ports(JD_PORT_AUDIO, JD_PORT_OUTPUT | JD_PORT_PHYSICAL);
     if (cap) {
-        for (int i = 0; i < 2 && cap[i]; i++) {
-            jack_connect(h->client, cap[i], jack_port_name(h->jin[i]));
+        int first = 0;
+        if (card[0]) {
+            for (int i = 0; cap[i]; i++) {
+                if (card_prefix_len(cap[i]) == strlen(card) &&
+                    !strncmp(cap[i], card, strlen(card))) {
+                    first = i;
+                    break;
+                }
+            }
         }
-        jack_free(cap);
+        for (int i = 0; i < 2 && cap[first + i]; i++) {
+            (void)h->be->connect(cap[first + i], h->be->port_name(h->pin[i]));
+        }
+        h->be->free_ports(cap);
     }
+}
+
+const char **lv2host_get_sources(Lv2Host *h)
+{
+    return h->be ? h->be->get_ports(JD_PORT_AUDIO, JD_PORT_OUTPUT) : NULL;
+}
+
+void lv2host_free_sources(Lv2Host *h, const char **sources)
+{
+    if (h->be && sources) {
+        h->be->free_ports(sources);
+    }
+}
+
+int lv2host_connect_input(Lv2Host *h, const char *source, int input)
+{
+    if (!h->be || !source || input < 0 || input > 1) {
+        return -1;
+    }
+    return h->be->connect(source, h->be->port_name(h->pin[input]));
+}
+
+int lv2host_disconnect_input(Lv2Host *h, const char *source, int input)
+{
+    if (!h->be || !source || input < 0 || input > 1) {
+        return -1;
+    }
+    return h->be->disconnect(source, h->be->port_name(h->pin[input]));
+}
+
+void lv2host_set_passthrough(Lv2Host *h, bool on)
+{
+    h->passthrough = on ? 1 : 0;
+}
+
+const char *lv2host_backend_name(const Lv2Host *h)
+{
+    return h->be ? h->be->name : "";
+}
+
+uint32_t lv2host_period(const Lv2Host *h)
+{
+    return h->be ? (uint32_t)h->be->buffer_size() : 0;
 }
 
 bool lv2host_write_control_port(Lv2Host *h, uint32_t port_index, float val)
@@ -767,20 +881,22 @@ float lv2host_get_control(const Lv2Host *h, uint32_t port_index)
     return h->ctl[port_index];
 }
 
-bool lv2host_open(Lv2Host *h, const char *plugin_uri, const char *client_name)
+bool lv2host_open(Lv2Host *h, const char *plugin_uri, const char *client_name,
+                  const Lv2hOpenOptions *opt)
 {
     memset(h, 0, sizeof(*h));
+    h->passthrough = 1;
 
     h->world = lilv_world_new();
     if (!h->world) {
-        fprintf(stderr, "error: lilv_world_new failed\n");
+        host_err(h, "the LV2 world could not be created");
         return false;
     }
     lilv_world_load_all(h->world);
 
     LilvNode *uri = lilv_new_uri(h->world, plugin_uri);
     if (!uri) {
-        fprintf(stderr, "error: '%s' is not a valid URI\n", plugin_uri);
+        host_err(h, "'%s' is not a valid URI", plugin_uri);
         lilv_world_free(h->world);
         h->world = NULL;
         return false;
@@ -789,37 +905,60 @@ bool lv2host_open(Lv2Host *h, const char *plugin_uri, const char *client_name)
     h->plugin = lilv_plugins_get_by_uri(plugins, uri);
     lilv_node_free(uri);
     if (!h->plugin) {
-        fprintf(stderr, "error: plugin <%s> not found (check lv2ls / LV2_PATH)\n", plugin_uri);
+        host_err(h, "the plug-in <%s> is not installed (check lv2ls and LV2_PATH)", plugin_uri);
         lilv_world_free(h->world);
         h->world = NULL;
         return false;
     }
-    if (!check_required_features(h->plugin)) {
+    if (!check_required_features(h, h->plugin)) {
         lilv_world_free(h->world);
         h->world = NULL;
         return false;
     }
 
-    h->client = jack_client_open(client_name, JackNullOption, NULL);
-    if (!h->client) {
-        fprintf(stderr, "error: cannot connect to JACK (is jackd running?)\n");
+    /* The audio system. The Media Kit backend is built in; JACK is the
+       jack.so add-on, found by audio_backend_load_for. */
+    const char *which =
+        (opt && opt->backend && !strcmp(opt->backend, "jack")) ? "jack" : "mediakit";
+    const char *addon = (opt && opt->addon_name) ? opt->addon_name : client_name;
+    char why[256] = "";
+    h->be =
+        audio_backend_load_for(which, addon, opt ? opt->backend_dir_env : NULL, why, sizeof why);
+    if (!h->be) {
+        host_err(h, "%s", why[0] ? why : "the audio system is not available");
         lilv_world_free(h->world);
         h->world = NULL;
         return false;
     }
-    h->sample_rate = (double)jack_get_sample_rate(h->client);
-    h->max_block = jack_get_buffer_size(h->client);
+    if (!strcmp(which, "mediakit")) {
+        jackdaw_mediakit_set_node_name(client_name);
+    }
+    static const JdBackendCallbacks cbs = {
+        process_cb, buffer_size_cb, NULL, xrun_cb, shutdown_cb, NULL, NULL,
+    };
+    if (h->be->open(client_name, &cbs, h, why, sizeof why) != 0) {
+        host_err(h, "%s", why[0] ? why : "the audio system could not be opened");
+        h->be = NULL;
+        lilv_world_free(h->world);
+        h->world = NULL;
+        return false;
+    }
+    h->sample_rate = (double)h->be->sample_rate();
+    /* The Media Kit may lengthen the period while running, up to the longer of
+       its period now and JD_MAX_PERIOD; size everything for that up front. */
+    h->max_block = h->be->buffer_size();
+    if (h->max_block < JD_MAX_PERIOD) {
+        h->max_block = JD_MAX_PERIOD;
+    }
 
-    h->jin[0] = jack_port_register(h->client, "in_l", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
-    h->jin[1] = jack_port_register(h->client, "in_r", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
-    h->jout[0] =
-        jack_port_register(h->client, "out_l", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
-    h->jout[1] =
-        jack_port_register(h->client, "out_r", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
-    if (!h->jin[0] || !h->jin[1] || !h->jout[0] || !h->jout[1]) {
-        fprintf(stderr, "error: jack_port_register failed\n");
-        jack_client_close(h->client);
-        h->client = NULL;
+    h->pin[0] = h->be->port_register("in_1", JD_PORT_AUDIO, JD_PORT_INPUT);
+    h->pin[1] = h->be->port_register("in_2", JD_PORT_AUDIO, JD_PORT_INPUT);
+    h->pout[0] = h->be->port_register("out_1", JD_PORT_AUDIO, JD_PORT_OUTPUT);
+    h->pout[1] = h->be->port_register("out_2", JD_PORT_AUDIO, JD_PORT_OUTPUT);
+    if (!h->pin[0] || !h->pin[1] || !h->pout[0] || !h->pout[1]) {
+        host_err(h, "the audio ports could not be registered");
+        h->be->close();
+        h->be = NULL;
         lilv_world_free(h->world);
         h->world = NULL;
         return false;
@@ -827,23 +966,15 @@ bool lv2host_open(Lv2Host *h, const char *plugin_uri, const char *client_name)
 
     if (!host_instantiate(h, h->sample_rate)) {
         host_destroy(h);
-        jack_client_close(h->client);
-        h->client = NULL;
+        h->be->close();
+        h->be = NULL;
         lilv_world_free(h->world);
         h->world = NULL;
         return false;
     }
 
-    if (jack_set_process_callback(h->client, process_cb, h) != 0) {
-        fprintf(stderr, "error: jack_set_process_callback failed\n");
-        lv2host_close(h);
-        return false;
-    }
-    if (jack_set_xrun_callback(h->client, xrun_cb, h) != 0) {
-        fprintf(stderr, "warning: jack_set_xrun_callback failed; xruns not counted\n");
-    }
-    if (jack_activate(h->client) != 0) {
-        fprintf(stderr, "error: jack_activate failed\n");
+    if (h->be->activate() != 0) {
+        host_err(h, "the audio client could not be started");
         lv2host_close(h);
         return false;
     }
@@ -852,10 +983,9 @@ bool lv2host_open(Lv2Host *h, const char *plugin_uri, const char *client_name)
 
 void lv2host_close(Lv2Host *h)
 {
-    if (h->client) {
-        jack_deactivate(h->client);
-        jack_client_close(h->client);
-        h->client = NULL;
+    if (h->be) {
+        h->be->close(); /* stops cycles, then closes; every port goes with it */
+        h->be = NULL;
     }
     host_destroy(h);
     if (h->world) {
