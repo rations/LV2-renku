@@ -1,8 +1,10 @@
 # LV2-renku
 
-> This repository is the source of the `lv2_haiku` package, part of the
-> [JackDAW stack](https://github.com/rations/jackDAW-renku) for RenkuOS. The 0.5
-> release's `install.sh` is for Haiku hrev60256; there is no RenkuOS release yet.
+> This repository is the source of two RenkuOS packages: `lv2_renku` (the LV2
+> specification bundles every LV2 host needs at runtime, the lilv tools and the hkamp
+> example plug-in) and `lv2_renku_jack` (`lv2jackhost`, which needs JACK). `lv2_renku`
+> replaces the old `lv2_haiku` package. [Kasen](https://github.com/rations/kasen), the
+> RenkuOS DAW, requires `lv2_renku`.
 
 Native port of the **LV2 plugin hosting stack** to **RenkuOS** (a Haiku fork).
 

@@ -1,0 +1,38 @@
+name			lv2_renku
+version			@VERSION@-@REVISION@
+architecture	x86_64
+summary			"LV2 plug-in hosting stack and tools (RenkuOS)"
+description		"The LV2 plug-in hosting stack built natively for RenkuOS: the LV2
+specification bundles that every LV2 host needs at runtime (installed to
+add-ons/media/LV2), the lilv tools (lv2ls, lv2info, lv2apply) and the hkamp example
+plug-in. The libraries (lilv, serd, sord, sratom, zix) are linked statically into the
+hosts that use them, such as Kasen. The JACK LV2 host, lv2jackhost, is the separate
+lv2_renku_jack package."
+packager		"rations <ehqcar@proton.me>"
+vendor			"rations"
+copyrights {
+	"2011-2026 David Robillard"
+	"2026 rations"
+}
+licenses {
+	"ISC"
+}
+provides {
+	lv2_renku = @VERSION@
+	# The package's former name, so packages that still require it stay
+	# installable after lv2_renku replaces it.
+	lv2_haiku = @VERSION@
+	cmd:lv2ls = 0.28.0
+	cmd:lv2info = 0.28.0
+	cmd:lv2apply = 0.28.0
+}
+requires {
+	haiku >= @HAIKU_MIN@
+	libsndfile
+}
+replaces {
+	lv2_haiku
+}
+urls {
+	"https://github.com/rations/LV2-renku"
+}
