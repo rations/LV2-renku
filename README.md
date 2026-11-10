@@ -4,9 +4,11 @@
 > specification bundles every LV2 host needs at runtime, the hosts `lv2host` and
 > `lv2guihost`, the lilv tools and the hkamp example plug-in. It replaces the old
 > `lv2_haiku` package. [Kasen](https://github.com/rations/kasen), the RenkuOS DAW, and
-> [rktuner](https://github.com/rations/rktuner) require it.
+> [rktuner](https://github.com/rations/rktuner) require it. Built packages are on the
+> [Releases](https://github.com/rations/LV2-renku/releases) page, and
+> [renku-audio](https://github.com/rations/renku-audio) lists the whole audio stack.
 
-Native port of the **LV2 plugin hosting stack** to **RenkuOS** (a Haiku fork).
+Native port of the **LV2 plugin hosting stack** to **RenkuOS**.
 
 This repo vendors the upstream drobilla suite pristine under `lv2stack/` — the
 [LV2](https://lv2plug.in) specification 1.18.11, zix 0.8.1, serd 0.32.10, sord 0.16.22,
@@ -16,7 +18,7 @@ project's own unmodified meson build. On top of that it adds:
 - **`hosts/lv2host`** — a headless host with a stdin prompt for parameters and inputs,
   for running and validating LV2 plug-ins live on RenkuOS hardware:
   `lv2host [--backend mediakit|jack] <plugin-uri>`.
-- **`hosts/lv2guihost`** — the same with the plug-in's own UI (HaikuUI or
+- **`hosts/lv2guihost`** — the same with the plug-in's own UI (`HaikuUI` or
   `ui:showInterface`).
 
   Both play through the RenkuOS Media Kit by default: one media node, patched in Cortex,
@@ -25,7 +27,7 @@ project's own unmodified meson build. On top of that it adds:
   copied unchanged into `jdbackend/` by `tools/sync-jdbackend.sh`; JACK support is the
   `jack.so` add-on (`add-ons/lv2host/`), so the hosts never link libjack. The hosting core
   and UI host are also staged as `liblv2host.a` for apps built on this stack (rktuner).
-- **`ns/ui-haiku.lv2`** — a small LV2 extension bundle defining the **HaikuUI** UI type:
+- **`ns/ui-haiku.lv2`** — a small LV2 extension bundle defining the `HaikuUI` UI type:
   a plugin UI whose `LV2UI_Widget` is a native `BView*`, exactly parallel to the spec's
   CocoaUI (`NSView*`). Plugins built for RenkuOS can ship native Interface Kit editors;
   `ui:showInterface` (UI owns its own `BWindow`) is supported as well.
