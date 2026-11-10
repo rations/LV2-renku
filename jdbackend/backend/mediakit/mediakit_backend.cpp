@@ -1,0 +1,3680 @@
+/* mediakit_backend.cpp — the RenkuOS Media Kit implementation of audio_backend.h.
+ *
+ * Kasen becomes one media node, "Kasen", that other nodes connect to and
+ * that the user patches in Cortex. It is a BBufferProducer and a
+ * BBufferConsumer driven by its own BMediaEventLooper, in the way
+ * SoundPlayNode (src/kits/media/SoundPlayNode.cpp) drives BSoundPlayer:
+ * one event per period, scheduled on the time source, each running one
+ * engine cycle and sending one buffer to every connected output.
+ *
+ * Engine ports and Media Kit connections. The engine was written for JACK:
+ * mono ports that it reads and writes each cycle, connected by name. Here a
+ * port is a mono buffer owned by the backend, and media connections carry
+ * several channels each.
+ *  - Outputs: as with JACK, every output port is a jack of its own: out_N
+ *    is the mono jack "Out N", and "metronome" the mono jack "Metronome".
+ *    out_1/out_2 also make the stereo jack "Master" (for the system mixer,
+ *    when there is no card to play on). A media output connects to exactly
+ *    one input, so every
+ *    jack always offers one more free output: the same signal can feed the
+ *    system mixer and a hardware input at once.
+ *  - Inputs: as with JACK, every capture port is a jack of its own: in_N is
+ *    "In N" (in_NR, a stereo track's right side, "In NR"). Each always
+ *    offers a free jack, and each connection made on it (from a hardware
+ *    capture output, or anything patched in a patchbay) becomes an input
+ *    with its own FIFO that feeds that port; several add up, as in JACK. A
+ *    connection with more channels than one feeds the port the one
+ *    connect() chose, or, made in a patchbay, left and right to in_N and
+ *    in_NR (a stereo track) or all of them mixed down. A source at another
+ *    rate (an app playing a 44.1 kHz file) is converted as it arrives, and
+ *    one on another clock is steered to ours, as PipeWire does; in JACK
+ *    every client runs at the server's rate, and here only the system mixer
+ *    converted. The track's input list offers apps' outputs as well as
+ *    hardware; an app's output goes to one place at a time, so choosing it
+ *    takes it from the system mixer, and undoing that gives it back.
+ *    The engine's connect(source, in_N) makes that connection on in_N's
+ *    jack (from another output of the same name when the first is in use,
+ *    as multi_audio offers), and disconnect undoes it, which is what
+ *    jack_connect and jack_disconnect do. Only an output that can come in
+ *    once and already does is read where it comes in (a route).
+ *  - Out 1/Out 2 (and the Metronome) connect to the playback 1/2 jacks of
+ *    the card that runs the clock when the node starts, as JACK's
+ *    system:playback_1/2, and the engine's get_ports(physical playback)
+ *    lists that card's mono jacks. Only without such a card does the Master
+ *    go to the system mixer instead.
+ *
+ * Clock. The rate and period are those of the card that runs the system
+ * time source (the default output), read from its playback jacks' format
+ * (multi_audio only accepts its driver's own rate and buffer length), or
+ * else of the system mixer's output; the node is slaved to the system time
+ * source. An output connection at another rate or buffer length, or to a
+ * consumer on another time source, is refused.
+ *
+ * Period changes (multi_audio's "Buffer size" setting, changed while
+ * running). Neither the system mixer nor multi_audio accepts ChangeFormat()
+ * from a producer, and the Media Kit sends no format-change notice, so:
+ *  - A hardware input that Kasen feeds directly asks for its new length
+ *    itself (FormatChangeRequested); it is accepted when every other output
+ *    goes to that same device or to the system mixer.
+ *  - The system mixer, when its output changes, tells its producers of its
+ *    new latency (LatencyChanged). The roster watcher then reads the mixer's
+ *    output format, and the node follows its period when all its outputs go
+ *    to the mixer. The mixer reads each buffer's size_used, but sizes its
+ *    ring for an input from the length in the connection's format (three
+ *    of them, or two output buffers); a longer buffer overruns it, and it
+ *    crashed the mixer in testing. So a consumer that leaves the length
+ *    open (the mixer does) is given the longest period we may change to,
+ *    and every buffer sent is one period, within it.
+ * The engine's mix buffers, the port buffers and the input FIFOs are sized
+ * for the longest period up front (JD_MAX_PERIOD, or the period at open if
+ * longer), so a change allocates nothing but the new buffer groups, as a
+ * connection does. A change during a take moves the rest of the take: the
+ * device restarts its streams and the capture latency changes with it.
+ *
+ * Threads.
+ *  - The node's control thread (BMediaEventLooper, B_URGENT_PRIORITY, the
+ *    looper default, so the system mixer and multi_audio at
+ *    B_REAL_TIME_PRIORITY always preempt it) runs the engine cycle, receives
+ *    capture buffers, and handles every connection hook. Those all run on
+ *    one thread, so the cycle never races a connection change.
+ *  - The engine's non-RT caller (the main window) registers ports, routes
+ *    capture channels and asks for connections. Port slots and routes are
+ *    published with atomics. Port buffers are never freed while the client
+ *    is open (a slot is reused), so the cycle can always read a slot it saw.
+ *    The input table is guarded by fInputLock for that caller.
+ *  - A small looper watches the roster and turns its notifications into the
+ *    engine's ports/connections/shutdown callbacks.
+ *
+ * MIDI (Midi Kit 2, patched in PatchBay; the Media Kit carries no MIDI).
+ *  - Each engine MIDI port is an endpoint registered with the MIDI roster:
+ *    an input port a BMidiLocalConsumer, an output port a BMidiLocalProducer,
+ *    named "Kasen MIDI in N", "Kasen MIDI out N", "Kasen control in".
+ *    The engine's connect(source, port) connects another endpoint by name.
+ *  - In: a consumer's own thread (the Midi Kit's, real-time priority) puts
+ *    each event and its time into a lock-free ring. The cycle that plays at
+ *    performance time P takes the events whose time falls in one period
+ *    ending at P's real time less the event and scheduling latency (when the
+ *    cycle nominally runs), each at its offset in that window. So every event
+ *    sounds the same fixed delay after it arrived, without jitter; that delay
+ *    is the MIDI ports' capture latency.
+ *  - Out: the cycle stamps each event with the real time its frame plays and
+ *    puts it in the port's ring; a writer thread sprays it (SprayData
+ *    allocates and locks). midi_server's hardware consumers wait for that
+ *    time before writing to the device, so MIDI out lines up with the audio.
+ *  - Endpoints and rings are made when a port slot is first registered as
+ *    MIDI and kept until close, like port buffers; unregistering disconnects
+ *    an endpoint and takes it off the roster.
+ *
+ * Allocation: buffers and FIFOs are allocated when a port is registered or a
+ * connection is made (the Media Kit runs connection hooks on the control
+ * thread, as for every node), and buffer groups also when the period
+ * changes; never per cycle. Buffer requests do not wait.
+ *
+ * Other hosts. Nothing here is Kasen's engine, so another program can build
+ * this file in and drive it through the same table (VST3-renku's vst3host
+ * does). jackdaw_mediakit_set_node_name renames the node and its MIDI
+ * endpoints, open's client name sets the ports' full-name prefix, and the
+ * Metronome jack is connected to the mixer only if a "metronome" port is
+ * registered before activate. */
+#include <Autolock.h>
+#include <Buffer.h>
+#include <BufferConsumer.h>
+#include <BufferGroup.h>
+#include <BufferProducer.h>
+#include <Locker.h>
+#include <Looper.h>
+#include <MediaDefs.h>
+#include <MediaEventLooper.h>
+#include <MediaNode.h>
+#include <MediaRoster.h>
+#include <MessageRunner.h>
+#include <Messenger.h>
+#include <MidiConsumer.h>
+#include <MidiProducer.h>
+#include <MidiRoster.h>
+#include <OS.h>
+#include <TimeSource.h>
+
+#include <algorithm>
+#include <atomic>
+#include <math.h>
+#include <new>
+#include <pthread.h>
+#include <samplerate.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <vector>
+
+#include "engine/audio_backend.h"
+#include "engine/rt_ringbuffer.h"
+
+namespace
+{
+
+const int32 kMaxPorts = 256;
+const int32 kMaxOutPorts = 64;            // out_1 .. out_64, as JACKDAW_MAX_TRACKS
+const int32 kMaxJacks = kMaxOutPorts + 2; // Master, Out 1 ... Out 64, Metronome
+const int32 kMaxOutConns = 8;             // connections per jack
+const int32 kMaxInputs = 128;             // input connections (a route keeps 8 bits)
+// The free input jack of capture port slot p has destination id
+// kFreeJackBase + p; a connection made on it gets the id of its Input.
+const int32 kFreeJackBase = 0x10000;
+const int32 kMaxInChannels = 64; // channels per input connection
+const int32 kMidiMaxEvents = 256;
+const int32 kMetronomeJack = kMaxJacks - 1;
+const int32 kFifoPeriods = 8; // FIFO capacity, in periods
+// An input is read once it holds this much (in half periods): a period and a
+// half at first. One period, the least that lets a cycle run at all, ran dry
+// once within seconds of connecting a UMC204HD at 1 ms -- a gap at the start
+// of the first take -- and then held. Each time it runs dry the wait grows by
+// half a period, up to two, so more margin for a device's delivery jitter is
+// only paid where it is needed.
+const int32 kPrimeHalvesFirst = 3;
+const int32 kPrimeHalvesMax = 4;
+// The capture latency reported for a take is the largest offset seen over
+// this long (see _FillInputs).
+const bigtime_t kLatencyWindowUs = 250000;
+
+const char *kCapturePrefix = "media:";
+
+// The node's name (Cortex, MIDI endpoint names, thread names, log lines) and
+// the prefix of our ports' full names ("<client name>:"). Written only by
+// jackdaw_mediakit_set_node_name and mk_open while no node exists, read after.
+char gNodeName[B_MEDIA_NAME_LENGTH] = "Kasen";
+char gClientPrefix[64] = "kasen:";
+
+enum { SEND_CYCLE_EVENT = BTimedEventQueue::B_USER_EVENT + 1 };
+enum {
+    MSG_DIAG_REPORT = 'jdmd',
+    MSG_CHECK_PERIOD = 'jdck',   // watcher: read the system mixer's period
+    MSG_PERIOD_CHANGED = 'jdpc', // watcher: report a period change
+};
+// Written to the node's control port by the roster watcher; handled in
+// JdMediaNode::HandleMessage. Media Kit codes are 0x100-0x7ff
+// (ServerInterface.h), so a four-letter code cannot collide with them.
+const int32 kFollowMixerCode = 'jdfm';
+struct FollowMixer {
+    float rate;
+    int32 period;
+    port_id mixerPort; // the mixer's control port: its inputs' destinations
+};
+// The control thread asks the watcher for a check at most once at a time.
+std::atomic<int32> gCheckQueued{0};
+const int32 kMinPeriod = 16;
+/* Slots of a consumer's port that our buffers leave free, for the control
+ * messages sent to it while it is busy (our own replies among them). */
+const int32 kPortHeadroom = 8;
+/* A group taken out of use waits this long at most for its buffers to come
+ * back before it is deleted anyway: longer than libmedia's 15 s port
+ * timeout, so a consumer that was stalled has given up or caught up. */
+const bigtime_t kRetireWait = 20000000;
+const int32 kMaxRetired = 16;
+
+/* KASEN_DIAG counters: written by the control thread with relaxed atomics
+ * (no lock, no allocation), read and printed every 2 s by the roster
+ * watcher's thread. */
+struct Diag {
+    std::atomic<int32> sent{0};              // buffers handed to SendBuffer
+    std::atomic<int32> sendFail{0};          // SendBuffer refused them
+    std::atomic<int32> noBuffer{0};          // the buffer group was empty
+    std::atomic<int32> portFull{0};          // the consumer's port had no room
+    std::atomic<int32> lateNotes{0};         // LateNoticeReceived
+    std::atomic<int32> lateUs{0};            // largest late notice, usecs
+    std::atomic<int32> peakMilli{0};         // largest master sample, x1000
+    std::atomic<int32> minLeadUs{INT32_MAX}; // least time between send and play
+    std::atomic<int32> lateWake{0};          // cycles woken a period late
+    // Capture, for the first input that delivers a buffer on our time
+    // source: does it keep pace with the cycle?
+    std::atomic<int32> capInput{-1};    // which input is measured
+    std::atomic<int32> capBufs{0};      // buffers received (this report)
+    std::atomic<int32> capGaps{0};      // stamp stepped > 1.5 buffers (this report)
+    std::atomic<int32> capMaxStepUs{0}; // largest stamp step (this report)
+    std::atomic<int32> capDry{0};       // input ran dry in a cycle (this report)
+    std::atomic<int32> capLatMin{INT32_MAX}, capLatMax{0}; // its offset, frames (this report)
+    std::atomic<int64> capFrames{0};                       // frames since the first stamp
+    std::atomic<int64> capSpanUs{0};                       // last stamp - first stamp
+    std::atomic<int64> capCycles0{0};                      // fCycles at the first stamp
+    bigtime_t capFirst = 0, capPrev = 0;                   // control thread only
+};
+Diag gDiag;
+bool gDiagOn = false;
+
+struct MidiBuffer {
+    uint32 count;
+    JdMidiEvent events[kMidiMaxEvents];
+    uint8 data[kMidiMaxEvents][4];
+};
+
+const char *kMidiPrefix = "midi:";
+const size_t kMidiRingBytes = 64 * 1024; // 4096 events
+
+/* One MIDI event in a port's ring: in, the time it arrived (system time, as
+ * midi_server's hardware producers stamp it, or 0 for "now"); out, the real
+ * time it is to play. Up to three bytes: the engine reads and writes no
+ * longer messages, and system exclusive is not passed. */
+struct MidiTimedEvent {
+    bigtime_t time;
+    uint8 size;
+    uint8 data[3];
+    uint8 pad[4];
+};
+
+/* A MIDI input port's endpoint. Data() runs on the consumer's own thread and
+ * is the ring's only writer. */
+class JdMidiIn : public BMidiLocalConsumer
+{
+public:
+    JdMidiIn(const char *name, rt_ringbuffer_t *ring) : BMidiLocalConsumer(name), fRing(ring)
+    {
+    }
+    void Data(uchar *data, size_t length, bool atomic, bigtime_t time) override
+    {
+        // One whole message per call (midi_server's producers spray them
+        // atomic); a raw byte stream or system exclusive is not passed on.
+        if (!atomic || length < 1 || length > 3 || !(data[0] & 0x80) || data[0] == 0xF0)
+            return;
+        MidiTimedEvent ev = {};
+        ev.time = time;
+        ev.size = (uint8)length;
+        memcpy(ev.data, data, length);
+        if (rt_ringbuffer_write_space(fRing) >= sizeof ev)
+            rt_ringbuffer_write(fRing, (const char *)&ev, sizeof ev);
+    }
+
+private:
+    rt_ringbuffer_t *fRing;
+};
+
+// The MIDI writer thread (sprays output rings) and its wakeup.
+sem_id gMidiSem = -1;
+thread_id gMidiThread = -1;
+std::atomic<int32> gMidiQuit{0};
+
+struct Port {
+    std::atomic<int32> used{0}; // 1 while registered (release/acquire)
+    int type = JD_PORT_AUDIO;
+    int direction = JD_PORT_INPUT;
+    char shortName[64] = "";
+    char fullName[80] = "";
+    float *audio = NULL;     // MaxPeriod() frames, kept until close
+    MidiBuffer *midi = NULL; // kept until close
+    // MIDI endpoints and ring (see the file comment), kept until close.
+    JdMidiIn *midiIn = NULL;
+    BMidiLocalProducer *midiOut = NULL;
+    rt_ringbuffer_t *midiRing = NULL;
+    // Inputs: (generation << 16) | (input << 8) | channel, or -1.
+    std::atomic<int32> route{-1};
+};
+
+struct OutConn {
+    bool reserved = false; // PrepareToConnect .. Disconnect
+    bool connected = false;
+    bool enabled = true;
+    media_output output;
+    BBufferGroup *group = NULL;
+    bool ownGroup = false; // group is ours (not the consumer's)
+    // The consumer chose the buffer length (a hardware input: exactly its
+    // own); otherwise the format carries the longest we may send.
+    bool fixedLength = false;
+    bigtime_t groupLead = 0; // how far ahead of play our group has buffers for
+    bigtime_t latency = 0;   // downstream
+    int32 portCapacity = 0;  // of the consumer's port; 0 = unknown
+};
+
+struct Jack {
+    std::atomic<int32> active{0};
+    char name[32] = "";
+    int32 channels = 0;
+    std::atomic<int32> portSlot[2] = {{-1}, {-1}};
+    OutConn conns[kMaxOutConns];
+};
+
+struct Input {
+    bool connected = false;
+    // The capture port (slot) whose jack this connection was made on, which
+    // it feeds, and which of its channels; -1 for none. Set on the control
+    // thread (Connected), the channel also by connect() under fInputLock.
+    std::atomic<int32> port{-1};
+    std::atomic<int32> channel{0};
+    uint8 generation = 0;
+    bool madeByUs = false;   // connect() made it; disconnect may undo it
+    media_node producerNode; // valid when madeByUs
+    media_input input;
+    int32 channels = 0;
+    // A connection that carries a whole source (made in a patchbay) rather
+    // than one channel connect() chose: a stereo source feeds in_N and in_NR
+    // when the track is stereo, else its channels mixed down to in_N.
+    std::atomic<bool> whole{true};
+    // An app's output that connect() took from the system mixer, given back
+    // to it when the connection is undone.
+    bool restoreToMixer = false;
+    media_format restoreFormat; // the format it had there
+    // A source at another rate is converted as it arrives (libsamplerate);
+    // NULL when it runs at ours. Control thread only, like the FIFO.
+    SRC_STATE *src = NULL;
+    double srcRatio = 1.0;              // our rate / its rate
+    double srcAdjust = 0.0;             // drift correction, another clock only
+    float *srcIn = NULL;                // a slice of raw frames, as float
+    float *srcOut = NULL;               // the same, converted
+    uint32 srcInCap = 0, srcOutCap = 0; // frames
+    // Its frames as they came, at its rate, interleaved float; the cycle
+    // converts what it needs each period (_Convert), so a long buffer is not
+    // converted all at once on the thread that runs the cycle.
+    float *raw = NULL;
+    uint32 rawCap = 0;                  // frames, power of two
+    uint64 rawWritten = 0, rawRead = 0; // frames
+    bool ourClock = true;               // its last buffer was stamped on our time source
+    // The most frames one of its buffers brought (at our rate): a source
+    // that sends long buffers (an app, 40 ms) is read once a whole one and
+    // the usual margin are in, so it does not run dry between buffers.
+    uint32 chunkFrames = 0;
+    float *fifo = NULL;           // interleaved float, capFrames frames
+    uint32 capFrames = 0;         // power of two
+    uint64 written = 0, read = 0; // frames; control thread only
+    float *scratch = NULL;        // this cycle, planar: channels x period (max period long)
+    bool primed = false;
+    int32 primeHalves = kPrimeHalvesFirst; // fill to start reading at
+    bigtime_t lastEnd = 0;                 // performance time after the newest frame
+    uint64 owed = 0;                       // frames of cycles that ran dry, still to drop
+    int32 latCur = -1, latPrev = -1;       // largest offset, this and the last window
+    int32 latCycles = 0;                   // cycles into this window
+    std::atomic<int32> latencyFrames{0};
+};
+
+// Set by the engine while a take is open (JdBackend::hold_latency).
+std::atomic<int32> gHoldLatency{0};
+
+bool format_is_convertible(uint32 f)
+{
+    return f == media_raw_audio_format::B_AUDIO_FLOAT ||
+           f == media_raw_audio_format::B_AUDIO_DOUBLE ||
+           f == media_raw_audio_format::B_AUDIO_INT || f == media_raw_audio_format::B_AUDIO_SHORT;
+}
+
+size_t sample_size(uint32 f)
+{
+    return f & media_raw_audio_format::B_AUDIO_SIZE_MASK;
+}
+
+inline float clampf(float v)
+{
+    return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+}
+
+void write_sample(char *dst, uint32 f, float v)
+{
+    switch (f) {
+        case media_raw_audio_format::B_AUDIO_FLOAT:
+            *(float *)dst = v;
+            break;
+        case media_raw_audio_format::B_AUDIO_DOUBLE:
+            *(double *)dst = v;
+            break;
+        case media_raw_audio_format::B_AUDIO_INT:
+            *(int32 *)dst = (int32)lrintf(clampf(v) * 2147483392.0f);
+            break;
+        case media_raw_audio_format::B_AUDIO_SHORT:
+            *(int16 *)dst = (int16)lrintf(clampf(v) * 32767.0f);
+            break;
+    }
+}
+
+float read_sample(const char *src, uint32 f)
+{
+    switch (f) {
+        case media_raw_audio_format::B_AUDIO_FLOAT:
+            return *(const float *)src;
+        case media_raw_audio_format::B_AUDIO_DOUBLE:
+            return (float)*(const double *)src;
+        case media_raw_audio_format::B_AUDIO_INT:
+            return (float)*(const int32 *)src * (1.0f / 2147483648.0f);
+        case media_raw_audio_format::B_AUDIO_SHORT:
+            return (float)*(const int16 *)src * (1.0f / 32768.0f);
+    }
+    return 0.0f;
+}
+
+uint32 next_pow2(uint32 v)
+{
+    uint32 p = 1;
+    while (p < v)
+        p <<= 1;
+    return p;
+}
+
+class JdMediaNode;
+
+/* Receives roster notifications on its own thread and forwards them to the
+ * engine's callbacks, which only post to the UI. */
+class RosterWatcher : public BLooper
+{
+public:
+    RosterWatcher() : BLooper("media watcher")
+    {
+    }
+    ~RosterWatcher() override
+    {
+        delete fDiagRunner;
+    }
+    void MessageReceived(BMessage *message) override;
+    BMessageRunner *fDiagRunner = NULL;
+};
+
+class JdMediaNode : public BBufferConsumer, public BBufferProducer, public BMediaEventLooper
+{
+public:
+    JdMediaNode(float rate, int32 period);
+    ~JdMediaNode() override;
+
+    // BMediaNode
+    BMediaAddOn *AddOn(int32 *internalID) const override;
+    status_t HandleMessage(int32 message, const void *data, size_t size) override;
+
+    // BBufferConsumer
+    status_t AcceptFormat(const media_destination &dest, media_format *format) override;
+    status_t GetNextInput(int32 *cookie, media_input *input) override;
+    void DisposeInputCookie(int32 cookie) override;
+    void BufferReceived(BBuffer *buffer) override;
+    void ProducerDataStatus(const media_destination &dest, int32 status,
+                            bigtime_t atPerformanceTime) override;
+    status_t GetLatencyFor(const media_destination &dest, bigtime_t *latency,
+                           media_node_id *timeSource) override;
+    status_t Connected(const media_source &producer, const media_destination &where,
+                       const media_format &format, media_input *input) override;
+    void Disconnected(const media_source &producer, const media_destination &where) override;
+    status_t FormatChanged(const media_source &producer, const media_destination &consumer,
+                           int32 changeTag, const media_format &format) override;
+
+    // BBufferProducer
+    status_t FormatSuggestionRequested(media_type type, int32 quality,
+                                       media_format *format) override;
+    status_t FormatProposal(const media_source &output, media_format *format) override;
+    status_t FormatChangeRequested(const media_source &source, const media_destination &dest,
+                                   media_format *format, int32 *deprecated) override;
+    status_t GetNextOutput(int32 *cookie, media_output *output) override;
+    status_t DisposeOutputCookie(int32 cookie) override;
+    status_t SetBufferGroup(const media_source &source, BBufferGroup *group) override;
+    status_t GetLatency(bigtime_t *latency) override;
+    status_t PrepareToConnect(const media_source &what, const media_destination &where,
+                              media_format *format, media_source *source, char *name) override;
+    void Connect(status_t error, const media_source &source, const media_destination &dest,
+                 const media_format &format, char *name) override;
+    void Disconnect(const media_source &what, const media_destination &where) override;
+    void LateNoticeReceived(const media_source &what, bigtime_t howMuch,
+                            bigtime_t performanceTime) override;
+    void EnableOutput(const media_source &what, bool enabled, int32 *deprecated) override;
+    void LatencyChanged(const media_source &source, const media_destination &dest,
+                        bigtime_t newLatency, uint32 flags) override;
+
+    // Used by the backend table.
+    float Rate() const
+    {
+        return fRate;
+    }
+    // Any thread. The control thread uses fPeriod.
+    int32 Period() const
+    {
+        return fPeriodShared.load(std::memory_order_relaxed);
+    }
+    // The longest period this node can change to; port buffers hold this.
+    int32 MaxPeriod() const
+    {
+        return fMaxPeriod;
+    }
+    bigtime_t CurrentEventLatency() const
+    {
+        return EventLatency();
+    }
+    Port fPorts[kMaxPorts];
+    Jack fJacks[kMaxJacks];
+    Input fInputs[kMaxInputs];
+    BLocker fInputLock; // the main window's view of fInputs
+    std::atomic<int32> fCycles{0};
+    // Set by mk_open before the node starts, so before any hook that uses
+    // them; a BMessenger to a looper that has quit just fails to send.
+    BMessenger fWatcher;
+    std::atomic<port_id> fMixerPort{-1}; // the system mixer's control port
+    // How long after it arrives a MIDI input event plays, in frames (the
+    // MIDI ports' capture latency). Written each cycle.
+    std::atomic<int32> fMidiDelayFrames{0};
+
+protected:
+    void NodeRegistered() override;
+    void HandleEvent(const media_timed_event *event, bigtime_t lateness,
+                     bool realTimeEvent) override;
+
+private:
+    OutConn *_FindOutput(const media_source &source, int32 *jackIndex = NULL);
+    Input *_FindInput(const media_destination &dest);
+    int32 _FreeJackPort(const media_destination &dest) const;
+    void _UpdateLatency();
+    void _RunCycle(bigtime_t performanceTime, bigtime_t lateness);
+    void _FillInputs(bigtime_t performanceTime);
+    void _DropDeadInputs();
+    int32 fDeadCheck = 0; // cycles since the last _DropDeadInputs()
+    void _WriteFifo(Input &in, const float *frames, uint32 count);
+    uint32 _PrimeFrames(const Input &in) const;
+    uint64 _Avail(const Input &in) const;
+    void _Convert(Input &in, uint64 want, bool ourClock);
+    Port *_RightPort(const Port &left);
+    void _DiagCapture(int32 index, bigtime_t start, uint32 frames);
+    void _DiagForgetCapture(int32 index);
+    void _SendOutputs(bigtime_t performanceTime);
+    void _FillMidi(Port &port, bigtime_t performanceTime);
+    void _SendMidi(bigtime_t performanceTime);
+    void _QueuePeriodCheck();
+    void _FollowMixer(const FollowMixer &m);
+    status_t _ChangePeriod(int32 period);
+    bool _OthersTakeLength(const OutConn *except, port_id consumerPort) const;
+    status_t _MakeOwnGroup(OutConn &o);
+    void _RetireGroup(BBufferGroup *group);
+    void _ReclaimRetired(bool all);
+
+    /* Buffer groups taken out of use (a new period, a new group, a
+     * disconnect) while their buffers may still be queued at a consumer or
+     * in its hands: deleting one then would invalidate buffers in flight.
+     * Each is deleted once all its buffers are back, or after kRetireWait.
+     * Control thread only. */
+    struct Retired {
+        BBufferGroup *group;
+        int32 back;      // buffers taken back from it
+        bigtime_t until; // delete it anyway after this (system time)
+    };
+    Retired fRetired[kMaxRetired];
+    int32 fRetiredCount = 0;
+
+    float fRate;
+    int32 fPeriod; // control thread
+    std::atomic<int32> fPeriodShared;
+    const int32 fMaxPeriod;
+    bigtime_t fInternalLatency;
+    bigtime_t fStartTime = 0;
+    uint64 fFramesSent = 0;
+    bool fThreadInitDone = false;
+};
+
+// ---- backend state (the engine's single client) ----
+
+JdMediaNode *gNode = NULL;
+RosterWatcher *gWatcher = NULL;
+JdBackendCallbacks gCb;
+void *gArg = NULL;
+
+void notify_xrun()
+{
+    if (gCb.xrun)
+        gCb.xrun(gArg);
+}
+
+void print_diag();
+void check_mixer_period();
+
+void RosterWatcher::MessageReceived(BMessage *message)
+{
+    switch (message->what) {
+        case B_MEDIA_NODE_CREATED:
+        case B_MEDIA_NODE_DELETED:
+            if (gCb.ports_changed)
+                gCb.ports_changed(gArg);
+            break;
+        case B_MEDIA_CONNECTION_MADE:
+        case B_MEDIA_CONNECTION_BROKEN:
+            if (gCb.connections_changed)
+                gCb.connections_changed(gArg);
+            break;
+        case B_MEDIA_SERVER_QUIT:
+            if (gCb.shutdown)
+                gCb.shutdown(gArg);
+            break;
+        case B_MIDI_EVENT:
+            switch (message->GetInt32("be:op", B_MIDI_NO_OP)) {
+                case B_MIDI_REGISTERED:
+                case B_MIDI_UNREGISTERED:
+                case B_MIDI_CHANGED_NAME:
+                    if (gCb.ports_changed)
+                        gCb.ports_changed(gArg);
+                    break;
+                case B_MIDI_CONNECTED:
+                case B_MIDI_DISCONNECTED:
+                    if (gCb.connections_changed)
+                        gCb.connections_changed(gArg);
+                    break;
+            }
+            break;
+        case MSG_DIAG_REPORT:
+            print_diag();
+            break;
+        case MSG_CHECK_PERIOD:
+            check_mixer_period();
+            break;
+        case MSG_PERIOD_CHANGED: {
+            int32 period = message->GetInt32("period", 0);
+            int32 old = message->GetInt32("old", 0);
+            float rate = gNode ? gNode->Rate() : 0.0f;
+            if (message->GetBool("refused", false))
+                fprintf(stderr,
+                        "%s media: a period of %d frames is outside %d..%d; staying at %d\n",
+                        gNodeName, (int)period, (int)kMinPeriod,
+                        gNode ? (int)gNode->MaxPeriod() : 0, (int)old);
+            else
+                fprintf(stderr, "%s media: period %d -> %d frames (%.2f ms)%s\n", gNodeName,
+                        (int)old, (int)period, rate > 0 ? 1000.0 * period / rate : 0.0,
+                        message->GetInt32("noGroup", 0) ? "; an output had no buffers left" : "");
+            break;
+        }
+        default:
+            BLooper::MessageReceived(message);
+            break;
+    }
+}
+
+// ---- JdMediaNode ----
+
+JdMediaNode::JdMediaNode(float rate, int32 period)
+    : BMediaNode(gNodeName), BBufferConsumer(B_MEDIA_RAW_AUDIO), BBufferProducer(B_MEDIA_RAW_AUDIO),
+      BMediaEventLooper(), fInputLock("media node inputs"), fRate(rate), fPeriod(period),
+      fPeriodShared(period), fMaxPeriod(period > JD_MAX_PERIOD ? period : JD_MAX_PERIOD)
+{
+    fInternalLatency = (bigtime_t)(1000000.0 * period / rate);
+    for (int32 j = 0; j < kMaxJacks; j++) {
+        for (int32 c = 0; c < kMaxOutConns; c++) {
+            OutConn &o = fJacks[j].conns[c];
+            o.output.source.port = 0; // set in NodeRegistered
+            o.output.source.id = j * kMaxOutConns + c;
+        }
+    }
+    for (int32 i = 0; i < kMaxInputs; i++)
+        fInputs[i].input.destination.id = i;
+}
+
+JdMediaNode::~JdMediaNode()
+{
+    Quit(); // waits for the control thread: no cycle runs after this
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        Port &port = fPorts[p];
+        free(port.audio);
+        free(port.midi);
+        // Taken off the roster and disconnected when unregistered (or by
+        // mk_close); releasing deletes them, which ends a consumer's thread.
+        if (port.midiIn)
+            port.midiIn->Release();
+        if (port.midiOut)
+            port.midiOut->Release();
+        if (port.midiRing)
+            rt_ringbuffer_free(port.midiRing);
+    }
+    for (int32 j = 0; j < kMaxJacks; j++)
+        for (int32 c = 0; c < kMaxOutConns; c++)
+            delete fJacks[j].conns[c].group;
+    _ReclaimRetired(true);
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        free(fInputs[i].fifo);
+        free(fInputs[i].scratch);
+        if (fInputs[i].src)
+            src_delete(fInputs[i].src);
+        free(fInputs[i].srcIn);
+        free(fInputs[i].srcOut);
+        free(fInputs[i].raw);
+    }
+}
+
+BMediaAddOn *JdMediaNode::AddOn(int32 *internalID) const
+{
+    if (internalID)
+        *internalID = 0;
+    return NULL; // an application node, not from an add-on
+}
+
+status_t JdMediaNode::HandleMessage(int32 message, const void *data, size_t size)
+{
+    // The event looper's base classes handle every Media Kit message; the
+    // only one of our own is the watcher's report of the mixer's period.
+    if (message == kFollowMixerCode && size == sizeof(FollowMixer)) {
+        _FollowMixer(*(const FollowMixer *)data);
+        return B_OK;
+    }
+    return B_ERROR;
+}
+
+void JdMediaNode::NodeRegistered()
+{
+    for (int32 j = 0; j < kMaxJacks; j++) {
+        for (int32 c = 0; c < kMaxOutConns; c++) {
+            media_output &out = fJacks[j].conns[c].output;
+            out.node = Node();
+            out.source.port = ControlPort();
+            out.destination = media_destination::null;
+        }
+    }
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        media_input &in = fInputs[i].input;
+        in.node = Node();
+        in.destination.port = ControlPort();
+        in.source = media_source::null;
+        in.format.type = B_MEDIA_RAW_AUDIO;
+        in.format.u.raw_audio = media_raw_audio_format::wildcard;
+        in.format.u.raw_audio.frame_rate = fRate;
+    }
+    SetBufferDuration((bigtime_t)(1000000.0 * fPeriod / fRate));
+    SetEventLatency(fInternalLatency);
+    // Priority stays at the looper default, B_URGENT_PRIORITY: below the
+    // system mixer and multi_audio (B_REAL_TIME_PRIORITY), so a heavy plug-in
+    // load never starves the system's own audio path.
+    Run();
+}
+
+OutConn *JdMediaNode::_FindOutput(const media_source &source, int32 *jackIndex)
+{
+    if (source.port != ControlPort() || source.id < 0 || source.id >= kMaxJacks * kMaxOutConns)
+        return NULL;
+    int32 j = source.id / kMaxOutConns;
+    if (jackIndex)
+        *jackIndex = j;
+    return &fJacks[j].conns[source.id % kMaxOutConns];
+}
+
+Input *JdMediaNode::_FindInput(const media_destination &dest)
+{
+    if (dest.port != ControlPort() || dest.id < 0 || dest.id >= kMaxInputs)
+        return NULL;
+    return &fInputs[dest.id];
+}
+
+/* The capture port slot whose free jack \a dest is, or -1. */
+int32 JdMediaNode::_FreeJackPort(const media_destination &dest) const
+{
+    if (dest.port != ControlPort() || dest.id < kFreeJackBase ||
+        dest.id >= kFreeJackBase + kMaxPorts)
+        return -1;
+    int32 p = dest.id - kFreeJackBase;
+    const Port &port = fPorts[p];
+    if (!port.used.load(std::memory_order_acquire) || port.type != JD_PORT_AUDIO ||
+        port.direction != JD_PORT_INPUT)
+        return -1;
+    return p;
+}
+
+/* A capture port's jack name, as JACK's port names read: in_3 -> "In 3",
+ * in_3R -> "In 3R"; any other name as it is. */
+void input_jack_name(const Port &port, char *name, size_t size)
+{
+    unsigned n;
+    char tail[8] = "";
+    if (sscanf(port.shortName, "in_%u%7s", &n, tail) >= 1)
+        snprintf(name, size, "In %u%s", n, tail);
+    else
+        snprintf(name, size, "%s", port.shortName);
+}
+
+void JdMediaNode::_UpdateLatency()
+{
+    bigtime_t downstream = 0;
+    for (int32 j = 0; j < kMaxJacks; j++)
+        for (int32 c = 0; c < kMaxOutConns; c++)
+            if (fJacks[j].conns[c].connected && fJacks[j].conns[c].latency > downstream)
+                downstream = fJacks[j].conns[c].latency;
+    SetEventLatency(downstream + fInternalLatency);
+    // Every output is sent this far ahead of play, so each holds that much
+    // in buffers at its consumer: a direct hardware input with little
+    // latency of its own still waits for the slowest path (the mixer's).
+    // Re-make a group of ours that no longer covers it, before it runs dry.
+    for (int32 j = 0; j < kMaxJacks; j++) {
+        for (int32 c = 0; c < kMaxOutConns; c++) {
+            OutConn &o = fJacks[j].conns[c];
+            if (o.connected && o.ownGroup && EventLatency() > o.groupLead + BufferDuration() &&
+                _MakeOwnGroup(o) != B_OK)
+                o.connected = false; // nothing to send from; it stays reserved
+        }
+    }
+}
+
+// ---- consumer side ----
+
+status_t JdMediaNode::AcceptFormat(const media_destination &dest, media_format *format)
+{
+    if (_FreeJackPort(dest) < 0)
+        return B_MEDIA_BAD_DESTINATION;
+    if (format->type == B_MEDIA_UNKNOWN_TYPE)
+        format->type = B_MEDIA_RAW_AUDIO;
+    if (format->type != B_MEDIA_RAW_AUDIO)
+        return B_MEDIA_BAD_FORMAT;
+    media_raw_audio_format &a = format->u.raw_audio;
+    const media_raw_audio_format &w = media_raw_audio_format::wildcard;
+    if (a.frame_rate == w.frame_rate)
+        a.frame_rate = fRate;
+    // Another rate is converted (an app plays a file at the file's rate; in
+    // JACK every client runs at the server's, here only the mixer converted).
+    if (a.frame_rate < fRate / 16.0f || a.frame_rate > fRate * 16.0f)
+        return B_MEDIA_BAD_FORMAT;
+    // A jack is one port, as in JACK, but an app's output is one stereo jack:
+    // a producer that leaves it open (MediaPlayer, the system mixer) sends
+    // stereo, which feeds in_N and in_NR, or is mixed down (_FillInputs).
+    // Hardware jacks are mono already.
+    if (a.channel_count == w.channel_count)
+        a.channel_count = 2;
+    if (a.channel_count < 1 || a.channel_count > (uint32)kMaxInChannels)
+        return B_MEDIA_BAD_FORMAT;
+    if (a.format == w.format)
+        a.format = media_raw_audio_format::B_AUDIO_FLOAT;
+    if (!format_is_convertible(a.format))
+        return B_MEDIA_BAD_FORMAT;
+    if (a.byte_order == w.byte_order)
+        a.byte_order = B_MEDIA_HOST_ENDIAN;
+    if (a.byte_order != B_MEDIA_HOST_ENDIAN)
+        return B_MEDIA_BAD_FORMAT;
+    if (a.buffer_size == w.buffer_size) {
+        int32 frames = (int32)lrint((double)fPeriod * a.frame_rate / fRate);
+        a.buffer_size =
+            (size_t)std::max(frames, (int32)1) * a.channel_count * sample_size(a.format);
+    }
+    return B_OK;
+}
+
+status_t JdMediaNode::GetNextInput(int32 *cookie, media_input *input)
+{
+    // Every connection, under the name of the jack it was made on, then one
+    // free jack for every capture port (the engine's in_N, JACK's ports), so
+    // each port takes any number of connections; they add up.
+    int32 seen = 0;
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        if (!fInputs[i].connected)
+            continue;
+        if (seen++ == *cookie) {
+            *input = fInputs[i].input;
+            *cookie += 1;
+            return B_OK;
+        }
+    }
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        media_destination dest(ControlPort(), kFreeJackBase + p);
+        if (_FreeJackPort(dest) < 0)
+            continue;
+        if (seen++ == *cookie) {
+            input->node = Node();
+            input->source = media_source::null;
+            input->destination = dest;
+            input->format.type = B_MEDIA_RAW_AUDIO;
+            input->format.u.raw_audio = media_raw_audio_format::wildcard;
+            input->format.u.raw_audio.frame_rate = fRate;
+            input->format.u.raw_audio.channel_count = 1;
+            input_jack_name(fPorts[p], input->name, sizeof input->name);
+            *cookie += 1;
+            return B_OK;
+        }
+    }
+    return B_BAD_INDEX;
+}
+
+void JdMediaNode::DisposeInputCookie(int32 /*cookie*/)
+{
+}
+
+status_t JdMediaNode::Connected(const media_source &producer, const media_destination &where,
+                                const media_format &format, media_input *input)
+{
+    // Made on a port's free jack: it becomes an input of its own (the roster
+    // takes the destination we return), feeding that port.
+    int32 p = _FreeJackPort(where);
+    if (p < 0)
+        return B_MEDIA_BAD_DESTINATION;
+    Input *in = NULL;
+    {
+        BAutolock lock(fInputLock);
+        for (int32 i = 0; i < kMaxInputs && !in; i++)
+            if (!fInputs[i].connected)
+                in = &fInputs[i];
+    }
+    if (!in)
+        return B_MEDIA_BAD_DESTINATION;
+    int32 ch = (int32)format.u.raw_audio.channel_count;
+    if (ch < 1 || ch > kMaxInChannels)
+        return B_MEDIA_BAD_FORMAT;
+
+    // A source at another rate: a converter, and room for one of its buffers
+    // before and after conversion (a longer buffer is converted in parts).
+    double rate = format.u.raw_audio.frame_rate;
+    SRC_STATE *src = NULL;
+    float *srcIn = NULL, *srcOut = NULL;
+    uint32 srcInCap = 0, srcOutCap = 0;
+    double ratio = rate > 0 ? fRate / rate : 1.0;
+    float *raw = NULL;
+    uint32 rawCap = 0;
+    if (rate > 0 && fabs(rate - fRate) > 0.5) {
+        size_t frameBytes = sample_size(format.u.raw_audio.format) * ch;
+        srcInCap = frameBytes ? (uint32)(format.u.raw_audio.buffer_size / frameBytes) : 0;
+        srcInCap = std::max(std::min(srcInCap, (uint32)65536), (uint32)4096);
+        srcOutCap = (uint32)ceil(srcInCap * ratio * 1.01) + 64;
+        rawCap = next_pow2(srcInCap * 4);
+        raw = (float *)malloc((size_t)rawCap * ch * sizeof(float));
+        int error = 0;
+        src = src_new(SRC_SINC_MEDIUM_QUALITY, ch, &error);
+        srcIn = (float *)malloc((size_t)srcInCap * ch * sizeof(float));
+        srcOut = (float *)malloc((size_t)srcOutCap * ch * sizeof(float));
+        if (!src || !srcIn || !srcOut || !raw) {
+            if (src)
+                src_delete(src);
+            free(srcIn);
+            free(srcOut);
+            free(raw);
+            return B_NO_MEMORY;
+        }
+    }
+
+    // Sized for the longest period, so a period change needs neither; and
+    // for a source's longest buffer (converted) on top of that.
+    uint32 cap = next_pow2((uint32)fMaxPeriod * kFifoPeriods + srcOutCap * 2);
+    float *fifo = (float *)calloc((size_t)cap * ch, sizeof(float));
+    float *scratch = (float *)calloc((size_t)fMaxPeriod * ch, sizeof(float));
+    if (!fifo || !scratch) {
+        free(fifo);
+        free(scratch);
+        if (src)
+            src_delete(src);
+        free(srcIn);
+        free(srcOut);
+        free(raw);
+        return B_NO_MEMORY;
+    }
+
+    BAutolock lock(fInputLock);
+    free(in->fifo);
+    free(in->scratch);
+    if (in->src)
+        src_delete(in->src);
+    free(in->srcIn);
+    free(in->srcOut);
+    free(in->raw);
+    in->raw = raw;
+    in->rawCap = rawCap;
+    in->rawWritten = in->rawRead = 0;
+    in->fifo = fifo;
+    in->scratch = scratch;
+    in->capFrames = cap;
+    in->channels = ch;
+    in->src = src;
+    in->srcRatio = ratio;
+    in->srcAdjust = 0.0;
+    in->srcIn = srcIn;
+    in->srcOut = srcOut;
+    in->srcInCap = srcInCap;
+    in->srcOutCap = srcOutCap;
+    in->chunkFrames = 0;
+    in->whole.store(true, std::memory_order_relaxed);
+    in->restoreToMixer = false;
+    in->written = in->read = 0;
+    in->primed = false;
+    in->primeHalves = kPrimeHalvesFirst;
+    in->lastEnd = 0;
+    in->owed = 0;
+    in->latCur = in->latPrev = -1;
+    in->latCycles = 0;
+    in->latencyFrames.store(0);
+    in->input.source = producer;
+    in->input.format = format;
+    input_jack_name(fPorts[p], in->input.name, sizeof in->input.name);
+    in->channel.store(0, std::memory_order_relaxed);
+    in->port.store(p, std::memory_order_release);
+    in->generation++;
+    in->connected = true;
+    _DiagForgetCapture(int32(in - fInputs));
+    *input = in->input;
+    return B_OK;
+}
+
+void JdMediaNode::Disconnected(const media_source &producer, const media_destination &where)
+{
+    Input *in = _FindInput(where);
+    if (!in || !in->connected || in->input.source != producer)
+        return;
+    BAutolock lock(fInputLock);
+    in->connected = false;
+    in->port.store(-1, std::memory_order_release);
+    in->generation++; // routes to it go silent
+    in->madeByUs = false;
+    _DiagForgetCapture(int32(in - fInputs));
+    in->input.source = media_source::null;
+    in->input.format.u.raw_audio = media_raw_audio_format::wildcard;
+    in->input.format.u.raw_audio.frame_rate = fRate;
+    // fifo/scratch stay allocated until reuse or close; nothing reads them now.
+}
+
+void JdMediaNode::BufferReceived(BBuffer *buffer)
+{
+    const media_header *h = buffer->Header();
+    media_destination dest(ControlPort(), h->destination);
+    Input *in = _FindInput(dest);
+    if (!in || !in->connected || h->type != B_MEDIA_RAW_AUDIO) {
+        buffer->Recycle();
+        return;
+    }
+    const media_raw_audio_format &a = in->input.format.u.raw_audio;
+    size_t ss = sample_size(a.format);
+    size_t frameBytes = ss * in->channels;
+    uint32 frames = frameBytes ? (uint32)(h->size_used / frameBytes) : 0;
+    const char *src = (const char *)buffer->Data();
+    bool ourClock = h->time_source == TimeSource()->ID();
+    // How long it lasts, at its own rate.
+    bigtime_t duration = a.frame_rate > 0 ? (bigtime_t)(1000000.0 * frames / a.frame_rate) : 0;
+
+    in->ourClock = ourClock;
+    if (in->src) {
+        // Kept as it came; the cycle converts it (_Convert).
+        if (frames > in->rawCap)
+            frames = in->rawCap;
+        if (in->rawWritten - in->rawRead + frames > in->rawCap)
+            in->rawRead = in->rawWritten + frames - in->rawCap; // overflow: oldest go
+        uint32 mask = in->rawCap - 1;
+        for (uint32 f = 0; f < frames; f++) {
+            float *dst = in->raw + ((in->rawWritten + f) & mask) * in->channels;
+            for (int32 c = 0; c < in->channels; c++)
+                dst[c] = read_sample(src + (f * in->channels + c) * ss, a.format);
+        }
+        in->rawWritten += frames;
+        uint32 made = (uint32)(frames * in->srcRatio);
+        if (made > in->chunkFrames)
+            in->chunkFrames = std::min(made, in->capFrames / 4);
+    } else {
+        if (frames > in->capFrames)
+            frames = in->capFrames;
+        // Overflow (a faster clock, or the cycle not running): drop the oldest.
+        uint64 fill = in->written - in->read;
+        if (fill + frames > in->capFrames)
+            in->read = in->written + frames - in->capFrames;
+        uint32 mask = in->capFrames - 1;
+        for (uint32 f = 0; f < frames; f++) {
+            float *dst = in->fifo + ((in->written + f) & mask) * in->channels;
+            for (int32 c = 0; c < in->channels; c++)
+                dst[c] = read_sample(src + (f * in->channels + c) * ss, a.format);
+        }
+        in->written += frames;
+        if (frames > in->chunkFrames)
+            in->chunkFrames = std::min(frames, in->capFrames / 4);
+    }
+    // When the buffer was captured, in our time source's performance time.
+    // A producer on our time source (the same device) stamps it exactly; any
+    // other node's stamps count from its own time source, so for those the
+    // arrival time on our clock stands in (late by its delivery time).
+    if (ourClock)
+        in->lastEnd = h->start_time + duration;
+    else
+        in->lastEnd = TimeSource()->Now();
+    if (gDiagOn && h->time_source == TimeSource()->ID())
+        _DiagCapture(int32(in - fInputs), h->start_time, frames);
+    buffer->Recycle();
+}
+
+/* KASEN_DIAG: capture stamps against the frames they carry. Control thread. */
+void JdMediaNode::_DiagCapture(int32 index, bigtime_t start, uint32 frames)
+{
+    int32 measured = gDiag.capInput.load(std::memory_order_relaxed);
+    if (measured < 0) {
+        gDiag.capInput.store(index, std::memory_order_relaxed);
+        gDiag.capCycles0.store(fCycles.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        gDiag.capFirst = gDiag.capPrev = start;
+        gDiag.capFrames.store(0, std::memory_order_relaxed);
+        gDiag.capSpanUs.store(0, std::memory_order_relaxed);
+        gDiag.capBufs.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (measured != index)
+        return;
+    bigtime_t step = start - gDiag.capPrev;
+    bigtime_t dur = (bigtime_t)(1000000.0 * frames / fRate);
+    if (step * 2 > dur * 3)
+        gDiag.capGaps.fetch_add(1, std::memory_order_relaxed);
+    if (step > gDiag.capMaxStepUs.load(std::memory_order_relaxed))
+        gDiag.capMaxStepUs.store((int32)step, std::memory_order_relaxed);
+    // Frames counted up to this buffer's start, so they match the span.
+    gDiag.capFrames.fetch_add(frames, std::memory_order_relaxed);
+    gDiag.capSpanUs.store(start - gDiag.capFirst, std::memory_order_relaxed);
+    gDiag.capPrev = start;
+    gDiag.capBufs.fetch_add(1, std::memory_order_relaxed);
+}
+
+/* KASEN_DIAG: the measured input's connection ended or was remade, so its
+ * stamps start over; measure afresh from the next buffer to arrive. */
+void JdMediaNode::_DiagForgetCapture(int32 index)
+{
+    if (gDiag.capInput.load(std::memory_order_relaxed) == index)
+        gDiag.capInput.store(-1, std::memory_order_relaxed);
+}
+
+void JdMediaNode::ProducerDataStatus(const media_destination & /*dest*/, int32 /*status*/,
+                                     bigtime_t /*atPerformanceTime*/)
+{
+}
+
+status_t JdMediaNode::GetLatencyFor(const media_destination &dest, bigtime_t *latency,
+                                    media_node_id *timeSource)
+{
+    // A producer may ask about a free jack before it connects to it.
+    if (!_FindInput(dest) && _FreeJackPort(dest) < 0)
+        return B_MEDIA_BAD_DESTINATION;
+    *latency = EventLatency();
+    *timeSource = TimeSource()->ID();
+    return B_OK;
+}
+
+status_t JdMediaNode::FormatChanged(const media_source &producer, const media_destination &consumer,
+                                    int32 /*changeTag*/, const media_format &format)
+{
+    // A producer's new buffer length (multi_audio's "Buffer size" setting)
+    // is fine: frames go through the FIFO whatever the buffer length, as long
+    // as a buffer fits in half of it. Anything else would need new FIFOs.
+    Input *in = _FindInput(consumer);
+    if (!in || !in->connected || in->input.source != producer || format.type != B_MEDIA_RAW_AUDIO)
+        return B_MEDIA_BAD_FORMAT;
+    const media_raw_audio_format &now = in->input.format.u.raw_audio;
+    const media_raw_audio_format &a = format.u.raw_audio;
+    size_t frameBytes = sample_size(a.format) * a.channel_count;
+    if (fabsf(a.frame_rate - now.frame_rate) > 0.5f || a.channel_count != now.channel_count ||
+        a.format != now.format || a.byte_order != now.byte_order || frameBytes == 0 ||
+        a.buffer_size / frameBytes > in->capFrames / 2)
+        return B_MEDIA_BAD_FORMAT;
+    bool newLength = a.buffer_size != now.buffer_size;
+    {
+        BAutolock lock(fInputLock);
+        in->input.format = format;
+    }
+    // The device's buffer length changed, so the mixer's may have too.
+    if (newLength)
+        _QueuePeriodCheck();
+    return B_OK;
+}
+
+// ---- producer side ----
+
+status_t JdMediaNode::FormatSuggestionRequested(media_type type, int32 /*quality*/,
+                                                media_format *format)
+{
+    if (type != B_MEDIA_UNKNOWN_TYPE && type != B_MEDIA_RAW_AUDIO)
+        return B_MEDIA_BAD_FORMAT;
+    format->type = B_MEDIA_RAW_AUDIO;
+    format->u.raw_audio = media_raw_audio_format::wildcard;
+    format->u.raw_audio.frame_rate = fRate;
+    format->u.raw_audio.channel_count = 2;
+    format->u.raw_audio.format = media_raw_audio_format::B_AUDIO_FLOAT;
+    format->u.raw_audio.byte_order = B_MEDIA_HOST_ENDIAN;
+    format->u.raw_audio.buffer_size = fPeriod * 2 * sizeof(float);
+    return B_OK;
+}
+
+status_t JdMediaNode::FormatProposal(const media_source &output, media_format *format)
+{
+    int32 j;
+    OutConn *o = _FindOutput(output, &j);
+    if (!o || !fJacks[j].active.load())
+        return B_MEDIA_BAD_SOURCE;
+    if (format->type == B_MEDIA_UNKNOWN_TYPE)
+        format->type = B_MEDIA_RAW_AUDIO;
+    if (format->type != B_MEDIA_RAW_AUDIO)
+        return B_MEDIA_BAD_FORMAT;
+    // Rate and channel count are fixed; sample format and buffer size are left
+    // as wildcards for the consumer to choose (multi_audio wants its device's
+    // own format and length), and PrepareToConnect checks what came back.
+    media_raw_audio_format &a = format->u.raw_audio;
+    a = media_raw_audio_format::wildcard;
+    a.frame_rate = fRate;
+    a.channel_count = fJacks[j].channels;
+    a.byte_order = B_MEDIA_HOST_ENDIAN;
+    return B_OK;
+}
+
+/* A consumer asks for another format: multi_audio does, for its new buffer
+ * length, when Kasen feeds a hardware input directly. Only the length may
+ * change, and it becomes the period of the whole node, so it is refused when
+ * another output goes to a consumer that would still want the old one. */
+status_t JdMediaNode::FormatChangeRequested(const media_source &source,
+                                            const media_destination &dest, media_format *format,
+                                            int32 * /*deprecated*/)
+{
+    int32 j;
+    OutConn *o = _FindOutput(source, &j);
+    if (!o || !o->connected || o->output.destination != dest)
+        return B_MEDIA_BAD_SOURCE;
+    if (format->type == B_MEDIA_UNKNOWN_TYPE)
+        format->type = B_MEDIA_RAW_AUDIO;
+    if (format->type != B_MEDIA_RAW_AUDIO)
+        return B_MEDIA_BAD_FORMAT;
+    media_raw_audio_format &a = format->u.raw_audio;
+    const media_raw_audio_format &now = o->output.format.u.raw_audio;
+    const media_raw_audio_format &w = media_raw_audio_format::wildcard;
+    if (a.frame_rate == w.frame_rate)
+        a.frame_rate = now.frame_rate;
+    if (a.channel_count == w.channel_count)
+        a.channel_count = now.channel_count;
+    if (a.format == w.format)
+        a.format = now.format;
+    if (a.byte_order == w.byte_order)
+        a.byte_order = now.byte_order;
+    if (a.buffer_size == w.buffer_size)
+        a.buffer_size = now.buffer_size;
+    size_t frame = sample_size(a.format) * a.channel_count;
+    if (fabsf(a.frame_rate - fRate) > 0.5f || a.channel_count != now.channel_count ||
+        a.format != now.format || a.byte_order != now.byte_order || frame == 0 ||
+        a.buffer_size % frame != 0)
+        return B_MEDIA_BAD_FORMAT;
+    // A connection with an open length carries the longest we may send,
+    // and keeps it: only a consumer that chose its length sets the period.
+    if (!o->fixedLength)
+        return a.buffer_size == now.buffer_size ? B_OK : B_MEDIA_BAD_FORMAT;
+    int32 period = (int32)(a.buffer_size / frame);
+    if (period == fPeriod)
+        return B_OK;
+
+    if (!_OthersTakeLength(o, dest.port))
+        return B_MEDIA_BAD_FORMAT;
+    return _ChangePeriod(period);
+}
+
+/* Whether every output but `except` could take a new period: it goes to the
+ * system mixer (any length) or to `consumerPort`, the node asking for it. */
+bool JdMediaNode::_OthersTakeLength(const OutConn *except, port_id consumerPort) const
+{
+    port_id mixer = fMixerPort.load(std::memory_order_relaxed);
+    for (int32 k = 0; k < kMaxJacks; k++) {
+        for (int32 c = 0; c < kMaxOutConns; c++) {
+            const OutConn &other = fJacks[k].conns[c];
+            if (!other.reserved || &other == except)
+                continue;
+            port_id port = other.output.destination.port;
+            if (port != consumerPort && port != mixer)
+                return false;
+        }
+    }
+    return true;
+}
+
+status_t JdMediaNode::GetNextOutput(int32 *cookie, media_output *output)
+{
+    // Every connected output of every active jack, then one free output per
+    // jack (so each jack can always be connected once more).
+    int32 seen = 0;
+    for (int32 pass = 0; pass < 2; pass++) {
+        for (int32 j = 0; j < kMaxJacks; j++) {
+            Jack &jk = fJacks[j];
+            if (!jk.active.load())
+                continue;
+            for (int32 c = 0; c < kMaxOutConns; c++) {
+                OutConn &o = jk.conns[c];
+                bool want = (pass == 0) ? o.reserved : !o.reserved;
+                if (!want)
+                    continue;
+                if (seen++ == *cookie) {
+                    *output = o.output;
+                    if (!o.reserved) {
+                        output->format.type = B_MEDIA_RAW_AUDIO;
+                        output->format.u.raw_audio = media_raw_audio_format::wildcard;
+                        output->format.u.raw_audio.frame_rate = fRate;
+                        output->format.u.raw_audio.channel_count = jk.channels;
+                        snprintf(output->name, sizeof output->name, "%s", jk.name);
+                    }
+                    *cookie += 1;
+                    return B_OK;
+                }
+                if (pass == 1)
+                    break; // one free output per jack
+            }
+        }
+    }
+    return B_BAD_INDEX;
+}
+
+status_t JdMediaNode::DisposeOutputCookie(int32 /*cookie*/)
+{
+    return B_OK;
+}
+
+status_t JdMediaNode::SetBufferGroup(const media_source &source, BBufferGroup *group)
+{
+    OutConn *o = _FindOutput(source);
+    if (!o || !o->reserved)
+        return B_MEDIA_BAD_SOURCE;
+    // NULL asks for our own group, so only a consumer's group already in use
+    // is a no-op.
+    if (group != NULL && group == o->group)
+        return B_OK;
+    _RetireGroup(o->group);
+    o->group = group;
+    o->ownGroup = false;
+    if (!o->group)
+        return _MakeOwnGroup(*o);
+    return B_OK;
+}
+
+/* A group of our own for o's buffers: enough for every buffer between being
+ * sent, the node's event latency (or o's own path, if that is longer and not
+ * counted in yet) ahead of play, and coming back. */
+status_t JdMediaNode::_MakeOwnGroup(OutConn &o)
+{
+    _RetireGroup(o.group);
+    o.group = NULL;
+    o.ownGroup = false;
+    bigtime_t lead = o.latency + fInternalLatency;
+    if (EventLatency() > lead)
+        lead = EventLatency();
+    o.groupLead = lead;
+    int32 count = (int32)((lead + BufferDuration() - 1) / BufferDuration()) + 3;
+    o.group = new (std::nothrow) BBufferGroup(o.output.format.u.raw_audio.buffer_size, count);
+    if (!o.group || o.group->InitCheck() != B_OK) {
+        delete o.group;
+        o.group = NULL;
+        return B_NO_MEMORY;
+    }
+    o.ownGroup = true;
+    return B_OK;
+}
+
+void JdMediaNode::_RetireGroup(BBufferGroup *group)
+{
+    if (!group)
+        return;
+    if (fRetiredCount == kMaxRetired) {
+        // Full (period changes faster than buffers come back): the oldest
+        // has waited longest.
+        delete fRetired[0].group;
+        memmove(&fRetired[0], &fRetired[1], (kMaxRetired - 1) * sizeof fRetired[0]);
+        fRetiredCount--;
+    }
+    fRetired[fRetiredCount++] = {group, 0, system_time() + kRetireWait};
+}
+
+/* Takes back what has come home of each retired group's buffers, without
+ * waiting, and deletes a group that has them all (or has waited long
+ * enough); `all` deletes every one. A buffer taken back stays out of the
+ * group, so the count only grows. Control thread, once a cycle. */
+void JdMediaNode::_ReclaimRetired(bool all)
+{
+    bigtime_t now = system_time();
+    int32 kept = 0;
+    for (int32 i = 0; i < fRetiredCount; i++) {
+        Retired &r = fRetired[i];
+        int32 count = 0;
+        if (r.group->CountBuffers(&count) != B_OK)
+            count = 0;
+        while (!all && r.back < count && r.group->RequestBuffer((size_t)1, 0) != NULL)
+            r.back++;
+        if (all || r.back >= count || now >= r.until) {
+            delete r.group;
+            continue;
+        }
+        fRetired[kept++] = r;
+    }
+    fRetiredCount = kept;
+}
+
+status_t JdMediaNode::GetLatency(bigtime_t *latency)
+{
+    *latency = EventLatency() + SchedulingLatency();
+    return B_OK;
+}
+
+status_t JdMediaNode::PrepareToConnect(const media_source &what, const media_destination &where,
+                                       media_format *format, media_source *source, char *name)
+{
+    int32 j;
+    OutConn *o = _FindOutput(what, &j);
+    if (!o || !fJacks[j].active.load())
+        return B_MEDIA_BAD_SOURCE;
+    if (o->reserved)
+        return B_MEDIA_ALREADY_CONNECTED;
+    if (format->type != B_MEDIA_UNKNOWN_TYPE && format->type != B_MEDIA_RAW_AUDIO)
+        return B_MEDIA_BAD_FORMAT;
+    format->type = B_MEDIA_RAW_AUDIO;
+    media_raw_audio_format &a = format->u.raw_audio;
+    const media_raw_audio_format &w = media_raw_audio_format::wildcard;
+    if (a.frame_rate == w.frame_rate)
+        a.frame_rate = fRate;
+    if (a.channel_count == w.channel_count)
+        a.channel_count = fJacks[j].channels;
+    if (a.format == w.format)
+        a.format = media_raw_audio_format::B_AUDIO_FLOAT;
+    if (a.byte_order == w.byte_order)
+        a.byte_order = B_MEDIA_HOST_ENDIAN;
+    size_t frame = (size_t)a.channel_count * sample_size(a.format);
+    size_t want = (size_t)fPeriod * frame;
+    // A consumer that leaves the length open gets the longest we may send:
+    // it sizes its buffering for that, and the period may grow up to it.
+    bool fixedLength = a.buffer_size != w.buffer_size;
+    if (!fixedLength)
+        a.buffer_size = want = (size_t)fMaxPeriod * frame;
+    // Our clock is the hardware's: refuse another rate or buffer length rather
+    // than resample.
+    if (fabsf(a.frame_rate - fRate) > 0.5f || a.channel_count != (uint32)fJacks[j].channels ||
+        !format_is_convertible(a.format) || a.byte_order != B_MEDIA_HOST_ENDIAN || frame == 0 ||
+        a.buffer_size != want)
+        return B_MEDIA_BAD_FORMAT;
+    // Buffers are stamped in our time source's performance time, and a
+    // consumer plays them by its own. One on another clock (a second sound
+    // card, while the system mixer and its time source are on the first)
+    // drifts from ours; in testing, a UMC204HD that was not the default
+    // output also never gave our buffers back, so the output ran out of
+    // them at once. Two clocks would need resampling; refuse instead.
+    bigtime_t consumerLatency;
+    media_node_id consumerClock;
+    if (FindLatencyFor(where, &consumerLatency, &consumerClock) != B_OK ||
+        consumerClock != TimeSource()->ID())
+        return B_MEDIA_BAD_DESTINATION;
+
+    o->reserved = true;
+    o->fixedLength = fixedLength;
+    o->output.destination = where;
+    o->output.format = *format;
+    strlcpy(o->output.name, fJacks[j].name, sizeof o->output.name);
+    *source = o->output.source;
+    strlcpy(name, o->output.name, B_MEDIA_NAME_LENGTH);
+    return B_OK;
+}
+
+void JdMediaNode::Connect(status_t error, const media_source &source, const media_destination &dest,
+                          const media_format &format, char *name)
+{
+    int32 j;
+    OutConn *o = _FindOutput(source, &j);
+    if (!o)
+        return;
+    if (error != B_OK) {
+        o->reserved = false;
+        o->output.destination = media_destination::null;
+        return;
+    }
+    o->output.destination = dest;
+    o->output.format = format;
+    strlcpy(name, o->output.name, B_MEDIA_NAME_LENGTH);
+
+    media_node_id ts;
+    if (FindLatencyFor(dest, &o->latency, &ts) != B_OK)
+        o->latency = 0;
+    port_info pinfo;
+    o->portCapacity = get_port_info(dest.port, &pinfo) == B_OK ? pinfo.capacity : 0;
+    if (!o->group)
+        SetBufferGroup(source, NULL);
+    o->enabled = true;
+    o->connected = (o->group != NULL);
+    _UpdateLatency();
+}
+
+void JdMediaNode::Disconnect(const media_source &what, const media_destination &where)
+{
+    OutConn *o = _FindOutput(what);
+    if (!o || !o->reserved || o->output.destination != where)
+        return;
+    o->connected = false;
+    o->reserved = false;
+    o->fixedLength = false;
+    o->output.destination = media_destination::null;
+    _RetireGroup(o->group);
+    o->group = NULL;
+    o->ownGroup = false;
+    o->latency = 0;
+    o->portCapacity = 0;
+    _UpdateLatency();
+    // That may have been what held the period off the mixer's.
+    _QueuePeriodCheck();
+}
+
+void JdMediaNode::LateNoticeReceived(const media_source &what, bigtime_t howMuch,
+                                     bigtime_t /*performanceTime*/)
+{
+    if (!_FindOutput(what))
+        return;
+    gDiag.lateNotes.fetch_add(1, std::memory_order_relaxed);
+    if (howMuch > gDiag.lateUs.load(std::memory_order_relaxed))
+        gDiag.lateUs.store((int32)howMuch, std::memory_order_relaxed);
+    notify_xrun();
+    // A consumer got our buffer late: produce earlier from now on (bounded),
+    // as SoundPlayNode does.
+    fInternalLatency += howMuch;
+    bigtime_t cap = 4 * BufferDuration() + 10000;
+    if (fInternalLatency > cap)
+        fInternalLatency = cap;
+    _UpdateLatency();
+}
+
+void JdMediaNode::EnableOutput(const media_source &what, bool enabled, int32 * /*deprecated*/)
+{
+    OutConn *o = _FindOutput(what);
+    if (o)
+        o->enabled = enabled;
+}
+
+void JdMediaNode::LatencyChanged(const media_source &source, const media_destination &dest,
+                                 bigtime_t newLatency, uint32 /*flags*/)
+{
+    OutConn *o = _FindOutput(source);
+    if (!o || o->output.destination != dest)
+        return;
+    o->latency = newLatency;
+    _UpdateLatency();
+    // The system mixer sends this when its output format changes, which is
+    // the only notice there is of a new hardware buffer length.
+    _QueuePeriodCheck();
+}
+
+/* Ask the roster watcher to read the system mixer's period (it may not query
+ * the mixer from here: the mixer could be waiting on us). One at a time. */
+void JdMediaNode::_QueuePeriodCheck()
+{
+    if (gCheckQueued.exchange(1, std::memory_order_acq_rel) != 0)
+        return;
+    BMessage check(MSG_CHECK_PERIOD);
+    if (fWatcher.SendMessage(&check, (BHandler *)NULL, 0) != B_OK)
+        gCheckQueued.store(0, std::memory_order_release);
+}
+
+/* The watcher's reading of the system mixer's output. Follow its period when
+ * every output goes to the mixer; a hardware input connected directly asks
+ * for its own length instead (FormatChangeRequested). */
+void JdMediaNode::_FollowMixer(const FollowMixer &m)
+{
+    fMixerPort.store(m.mixerPort, std::memory_order_relaxed);
+    if (m.period == fPeriod || fabsf(m.rate - fRate) > 0.5f)
+        return; // a new rate needs a restart of Kasen
+    for (int32 j = 0; j < kMaxJacks; j++)
+        for (int32 c = 0; c < kMaxOutConns; c++)
+            if (fJacks[j].conns[c].connected &&
+                fJacks[j].conns[c].output.destination.port != m.mixerPort)
+                return;
+    _ChangePeriod(m.period);
+}
+
+/* Run at `period` frames from the next cycle on. Control thread, between
+ * cycles. */
+status_t JdMediaNode::_ChangePeriod(int32 period)
+{
+    int32 old = fPeriod;
+    if (period == old)
+        return B_OK;
+    if (period < kMinPeriod || period > fMaxPeriod) {
+        BMessage note(MSG_PERIOD_CHANGED);
+        note.AddInt32("period", period);
+        note.AddInt32("old", old);
+        note.AddBool("refused", true);
+        fWatcher.SendMessage(&note, (BHandler *)NULL, 0);
+        return B_MEDIA_BAD_FORMAT;
+    }
+
+    // The engine's buffers already hold the longest period, so this only
+    // sets its cycle length.
+    if (gCb.buffer_size)
+        gCb.buffer_size((jd_nframes_t)period, gArg);
+    fPeriod = period;
+    fPeriodShared.store(period, std::memory_order_relaxed);
+    bigtime_t duration = (bigtime_t)(1000000.0 * period / fRate);
+    SetBufferDuration(duration);
+    fInternalLatency = duration; // late notices start over
+
+    int32 noGroup = 0;
+    for (int32 j = 0; j < kMaxJacks; j++) {
+        for (int32 c = 0; c < kMaxOutConns; c++) {
+            OutConn &o = fJacks[j].conns[c];
+            if (!o.reserved)
+                continue;
+            // A fixed length is the consumer's, which asked for this one; an
+            // open one already allows every period up to fMaxPeriod.
+            media_raw_audio_format &a = o.output.format.u.raw_audio;
+            if (o.fixedLength)
+                a.buffer_size = (size_t)period * a.channel_count * sample_size(a.format);
+            if (!o.connected)
+                continue;
+            media_node_id ts;
+            if (FindLatencyFor(o.output.destination, &o.latency, &ts) != B_OK)
+                o.latency = 0;
+            // Our groups hold buffers of the old length and count: make them
+            // again in _UpdateLatency. A consumer's own group stays: a buffer
+            // of at least the new length is all a request needs.
+            if (o.ownGroup)
+                o.groupLead = -BufferDuration() - 1;
+        }
+    }
+    _UpdateLatency();
+    for (int32 j = 0; j < kMaxJacks; j++)
+        for (int32 c = 0; c < kMaxOutConns; c++)
+            if (fJacks[j].conns[c].reserved && !fJacks[j].conns[c].connected)
+                noGroup++;
+
+    // The device restarted its streams: read every input afresh.
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        Input &in = fInputs[i];
+        if (!in.connected)
+            continue;
+        in.read = in.written;
+        in.primed = false;
+        in.primeHalves = kPrimeHalvesFirst;
+        in.owed = 0;
+        in.latCur = in.latPrev = -1;
+        in.latCycles = 0;
+        _DiagForgetCapture(i);
+    }
+
+    BMessage note(MSG_PERIOD_CHANGED);
+    note.AddInt32("period", period);
+    note.AddInt32("old", old);
+    note.AddInt32("noGroup", noGroup);
+    fWatcher.SendMessage(&note, (BHandler *)NULL, 0);
+    return B_OK;
+}
+
+// ---- the cycle ----
+
+void JdMediaNode::HandleEvent(const media_timed_event *event, bigtime_t lateness,
+                              bool /*realTimeEvent*/)
+{
+    switch (event->type) {
+        case BTimedEventQueue::B_START:
+            if (RunState() != B_STARTED) {
+                fFramesSent = 0;
+                fStartTime = event->event_time;
+                media_timed_event first(event->event_time, SEND_CYCLE_EVENT);
+                EventQueue()->AddEvent(first);
+            }
+            break;
+        case BTimedEventQueue::B_STOP:
+            EventQueue()->FlushEvents(0, BTimedEventQueue::B_ALWAYS, true, SEND_CYCLE_EVENT);
+            break;
+        case SEND_CYCLE_EVENT:
+            if (RunState() == B_STARTED)
+                _RunCycle(event->event_time, lateness);
+            break;
+        default:
+            break;
+    }
+}
+
+void JdMediaNode::_RunCycle(bigtime_t performanceTime, bigtime_t lateness)
+{
+    if (!fThreadInitDone) {
+        fThreadInitDone = true;
+        if (gCb.thread_init)
+            gCb.thread_init(gArg);
+    }
+    // Woken a whole period late: the cycle cannot make its deadline.
+    if (lateness > BufferDuration()) {
+        gDiag.lateWake.fetch_add(1, std::memory_order_relaxed);
+        notify_xrun();
+    }
+
+    // About once a second: a producer that died left its input behind (the
+    // media server sends no notice for that).
+    if (++fDeadCheck * (int64)fPeriod >= (int64)fRate) {
+        fDeadCheck = 0;
+        _DropDeadInputs();
+    }
+    _FillInputs(performanceTime);
+    if (gCb.process)
+        gCb.process((jd_nframes_t)fPeriod, gArg);
+    _SendOutputs(performanceTime);
+    _SendMidi(performanceTime);
+    if (fRetiredCount > 0)
+        _ReclaimRetired(false);
+    fCycles.fetch_add(1, std::memory_order_release);
+
+    fFramesSent += (uint64)fPeriod;
+    bigtime_t next = fStartTime + (bigtime_t)(1000000.0 * (double)fFramesSent / fRate);
+    media_timed_event nextEvent(next, SEND_CYCLE_EVENT);
+    EventQueue()->AddEvent(nextEvent);
+}
+
+/* A producer whose team went away (an app quit or crashed) never
+ * disconnects, so its input would stay listed, and run dry every cycle,
+ * for good. Its control port goes with the team: drop the inputs whose
+ * producer's port is gone, as their Disconnected would. Control thread. */
+void JdMediaNode::_DropDeadInputs()
+{
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        Input &in = fInputs[i];
+        port_info info;
+        if (!in.connected || get_port_info(in.input.source.port, &info) == B_OK)
+            continue;
+        fprintf(stderr, "%s media: %s: its producer is gone\n", gNodeName, in.input.name);
+        Disconnected(in.input.source, in.input.destination);
+    }
+}
+
+/* Append interleaved frames to an input's FIFO; on overflow (a faster clock,
+ * or the cycle not running) the oldest go. Control thread. */
+void JdMediaNode::_WriteFifo(Input &in, const float *frames, uint32 count)
+{
+    if (count > in.capFrames) {
+        frames += (size_t)(count - in.capFrames) * in.channels;
+        count = in.capFrames;
+    }
+    uint64 fill = in.written - in.read;
+    if (fill + count > in.capFrames)
+        in.read = in.written + count - in.capFrames;
+    uint32 mask = in.capFrames - 1;
+    for (uint32 f = 0; f < count; f++)
+        memcpy(in.fifo + ((in.written + f) & mask) * in.channels, frames + (size_t)f * in.channels,
+               sizeof(float) * in.channels);
+    in.written += count;
+}
+
+/* Frames an input holds, at our rate: converted, and still to convert. */
+uint64 JdMediaNode::_Avail(const Input &in) const
+{
+    uint64 avail = in.written - in.read;
+    if (in.src)
+        avail += (uint64)((double)(in.rawWritten - in.rawRead) * in.srcRatio);
+    return avail;
+}
+
+/* Convert raw frames of a source at another rate until `want` frames are
+ * converted and unread, or the raw ones run out; a period's worth or so
+ * each cycle. A source on another clock drifts against ours, so its ratio is
+ * steered to keep the input at the margin the cycle reads with, as
+ * PipeWire's adaptive resampling. Control thread. */
+void JdMediaNode::_Convert(Input &in, uint64 want, bool ourClock)
+{
+    if (!ourClock && in.primed) {
+        // Between its buffers the input drains by one of them: aim the
+        // average at the middle of that.
+        double target = (double)_PrimeFrames(in) - in.chunkFrames / 2.0;
+        double error = ((double)_Avail(in) - target) / fRate; // seconds too many
+        double adjust = -error * 0.05;
+        in.srcAdjust = std::max(-0.002, std::min(0.002, 0.995 * in.srcAdjust + 0.005 * adjust));
+    }
+    uint32 mask = in.rawCap - 1;
+    while (in.written - in.read < want && in.rawWritten > in.rawRead) {
+        double ratio = in.srcRatio * (1.0 + in.srcAdjust);
+        uint64 need = want - (in.written - in.read);
+        uint32 part =
+            (uint32)std::min<uint64>(in.rawWritten - in.rawRead, (uint64)ceil(need / ratio) + 16);
+        part = std::min(part, in.srcInCap);
+        for (uint32 f = 0; f < part; f++)
+            memcpy(in.srcIn + (size_t)f * in.channels,
+                   in.raw + ((in.rawRead + f) & mask) * in.channels, sizeof(float) * in.channels);
+        SRC_DATA d;
+        memset(&d, 0, sizeof d);
+        d.data_in = in.srcIn;
+        d.input_frames = part;
+        d.data_out = in.srcOut;
+        d.output_frames = in.srcOutCap;
+        d.src_ratio = ratio;
+        if (src_process(in.src, &d) != 0 || d.input_frames_used == 0) {
+            in.rawRead = in.rawWritten; // give up on what is there
+            break;
+        }
+        in.rawRead += (uint64)d.input_frames_used;
+        _WriteFifo(in, in.srcOut, (uint32)d.output_frames_gen);
+    }
+}
+
+/* What an input must hold before the cycle starts reading it: its margin
+ * (primeHalves half periods), plus, for a source that sends buffers longer
+ * than our period, the rest of one of them, so it lasts until the next. */
+uint32 JdMediaNode::_PrimeFrames(const Input &in) const
+{
+    uint32 frames = ((uint32)fPeriod * in.primeHalves + 1) / 2;
+    if (in.chunkFrames > (uint32)fPeriod)
+        frames += in.chunkFrames - (uint32)fPeriod;
+    return frames;
+}
+
+void JdMediaNode::_FillInputs(bigtime_t performanceTime)
+{
+    // Take one period from every connected input into its planar scratch.
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        Input &in = fInputs[i];
+        if (!in.connected)
+            continue;
+        uint64 avail = _Avail(in);
+        // Frames of cycles that ran dry arrive late; drop them, so what
+        // follows plays (and records) where it belongs in time.
+        if (in.owed > 0) {
+            uint64 converted = in.written - in.read;
+            uint64 drop = in.owed < converted ? in.owed : converted;
+            in.read += drop;
+            in.owed -= drop;
+            avail -= drop;
+        }
+        if (!in.primed && avail >= (uint64)_PrimeFrames(in)) {
+            // Start reading at exactly the wait, dropping anything older: a
+            // backlog would stay in the FIFO as extra latency for good. One
+            // builds up when cycles pause while capture goes on, as they do
+            // for a moment after the period shrinks (the next cycle waits
+            // for the shorter lead).
+            uint64 target = _PrimeFrames(in);
+            if (avail > target) {
+                uint64 excess = avail - target;
+                uint64 converted = in.written - in.read;
+                uint64 fromConverted = std::min(excess, converted);
+                in.read += fromConverted;
+                excess -= fromConverted;
+                if (excess > 0 && in.src)
+                    in.rawRead += std::min<uint64>(in.rawWritten - in.rawRead,
+                                                   (uint64)(excess / in.srcRatio));
+                avail = _Avail(in);
+            }
+            in.primed = true;
+        }
+        if (!in.primed || avail < (uint64)fPeriod) {
+            if (in.primed) { // ran dry
+                if (gDiagOn)
+                    gDiag.capDry.fetch_add(1, std::memory_order_relaxed);
+                notify_xrun();
+                if (gHoldLatency.load(std::memory_order_relaxed) != 0) {
+                    // A take is open: keep the latency it was placed by.
+                    // This cycle plays silence and its frames are dropped
+                    // when they come. An input that has stopped altogether
+                    // starts over once it is owed half the FIFO.
+                    in.owed += (uint64)fPeriod;
+                    if (in.owed > in.capFrames / 2) {
+                        in.primed = false;
+                        in.owed = 0;
+                        in.read = in.written;
+                        in.latCur = in.latPrev = -1;
+                    }
+                } else {
+                    // Wait for it to refill, with more margin. That moves
+                    // the latency, which nothing is holding now.
+                    in.primed = false;
+                    if (in.primeHalves < kPrimeHalvesMax)
+                        in.primeHalves++;
+                    in.latCur = in.latPrev = -1;
+                }
+            }
+            memset(in.scratch, 0, sizeof(float) * fPeriod * in.channels);
+            continue;
+        }
+        // Capture-to-playback offset of the frames read now: they were
+        // captured at lastEnd - avail, and play out with this cycle at
+        // performanceTime. The engine shifts a recorded take back by this.
+        // A capture stamp can only be late (it comes from when the driver
+        // saw the buffer complete), which makes the offset look smaller, so
+        // the largest offset over the last window or two is the one
+        // reported.
+        bigtime_t captured = in.lastEnd - (bigtime_t)(1000000.0 * (double)avail / fRate);
+        double offset = (double)(performanceTime - captured) * fRate / 1000000.0;
+        int32 frames = offset > 0 ? (int32)(offset + 0.5) : 0;
+        if (frames > in.latCur)
+            in.latCur = frames;
+        if (++in.latCycles * (bigtime_t)fPeriod * 1000000 >= kLatencyWindowUs * (bigtime_t)fRate) {
+            in.latPrev = in.latCur;
+            in.latCur = frames;
+            in.latCycles = 0;
+        }
+        in.latencyFrames.store(in.latCur > in.latPrev ? in.latCur : in.latPrev,
+                               std::memory_order_relaxed);
+        if (gDiagOn && i == gDiag.capInput.load(std::memory_order_relaxed)) {
+            if (frames < gDiag.capLatMin.load(std::memory_order_relaxed))
+                gDiag.capLatMin.store(frames, std::memory_order_relaxed);
+            if (frames > gDiag.capLatMax.load(std::memory_order_relaxed))
+                gDiag.capLatMax.store(frames, std::memory_order_relaxed);
+        }
+
+        if (in.src)
+            _Convert(in, (uint64)fPeriod, in.ourClock);
+        // A converted input can fall a frame short of what _Avail() counted
+        // (the ratio is not exact): the rest of the period is silence.
+        int32 have = (int32)std::min<uint64>(in.written - in.read, (uint64)fPeriod);
+        uint32 mask = in.capFrames - 1;
+        for (int32 f = 0; f < fPeriod; f++) {
+            const float *src = in.fifo + ((in.read + f) & mask) * in.channels;
+            for (int32 c = 0; c < in.channels; c++)
+                in.scratch[c * fPeriod + f] = f < have ? src[c] : 0.0f;
+        }
+        in.read += (uint64)have;
+    }
+
+    // Then each routed capture port copies its channel.
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        Port &port = fPorts[p];
+        if (!port.used.load(std::memory_order_acquire))
+            continue;
+        if (port.type == JD_PORT_MIDI) {
+            if (port.direction == JD_PORT_INPUT)
+                _FillMidi(port, performanceTime);
+            continue;
+        }
+        if (port.direction != JD_PORT_INPUT)
+            continue;
+        int32 r = port.route.load(std::memory_order_acquire);
+        int32 ii = (r >> 8) & 0xff, ch = r & 0xff;
+        const Input *in = (r >= 0 && ii < kMaxInputs) ? &fInputs[ii] : NULL;
+        if (in && in->connected && in->generation == (uint8)(r >> 16) && ch < in->channels)
+            memcpy(port.audio, in->scratch + ch * fPeriod, sizeof(float) * fPeriod);
+        else
+            memset(port.audio, 0, sizeof(float) * fPeriod);
+    }
+
+    // And every connection made on a port's jack adds its channel to that
+    // port: several sum, as in JACK.
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        const Input &in = fInputs[i];
+        int32 p = in.port.load(std::memory_order_acquire);
+        if (!in.connected || p < 0 || p >= kMaxPorts)
+            continue;
+        Port &port = fPorts[p];
+        if (!port.used.load(std::memory_order_acquire) || port.type != JD_PORT_AUDIO ||
+            port.direction != JD_PORT_INPUT)
+            continue;
+        if (in.whole.load(std::memory_order_relaxed) && in.channels > 1) {
+            // A whole stereo (or wider) source: left to in_N and right to
+            // in_NR when the track is stereo, else all of it mixed down.
+            Port *right = _RightPort(port);
+            if (right) {
+                for (int32 f = 0; f < fPeriod; f++) {
+                    port.audio[f] += in.scratch[f];
+                    right->audio[f] += in.scratch[fPeriod + f];
+                }
+            } else {
+                float gain = 1.0f / in.channels;
+                for (int32 c = 0; c < in.channels; c++) {
+                    const float *src = in.scratch + c * fPeriod;
+                    for (int32 f = 0; f < fPeriod; f++)
+                        port.audio[f] += src[f] * gain;
+                }
+            }
+            continue;
+        }
+        int32 ch = in.channel.load(std::memory_order_relaxed);
+        if (ch < 0 || ch >= in.channels)
+            ch = 0;
+        const float *src = in.scratch + ch * fPeriod;
+        for (int32 f = 0; f < fPeriod; f++)
+            port.audio[f] += src[f];
+    }
+}
+
+/* The registered capture port "<name>R" (a stereo track's right side) of
+ * capture port `left`, or NULL. Control thread; reads only published slots. */
+Port *JdMediaNode::_RightPort(const Port &left)
+{
+    size_t len = strlen(left.shortName);
+    if (len == 0 || left.shortName[len - 1] == 'R')
+        return NULL;
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        Port &port = fPorts[p];
+        if (&port == &left || !port.used.load(std::memory_order_acquire) ||
+            port.type != JD_PORT_AUDIO || port.direction != JD_PORT_INPUT)
+            continue;
+        if (strncmp(port.shortName, left.shortName, len) == 0 && port.shortName[len] == 'R' &&
+            port.shortName[len + 1] == '\0')
+            return &port;
+    }
+    return NULL;
+}
+
+/* This cycle's MIDI input for one port: the events that arrived in the
+ * period before the cycle's nominal start (its performance time's real time
+ * less the event and scheduling latency), each at its offset in that window.
+ * Events that arrived later wait for the next cycle; late ones go first. */
+void JdMediaNode::_FillMidi(Port &port, bigtime_t performanceTime)
+{
+    MidiBuffer *m = port.midi;
+    m->count = 0;
+    if (!port.midiRing)
+        return;
+    bigtime_t delay = EventLatency() + SchedulingLatency() + BufferDuration();
+    fMidiDelayFrames.store((int32)(delay * (double)fRate / 1000000.0), std::memory_order_relaxed);
+    bigtime_t windowStart = TimeSource()->RealTimeFor(performanceTime, delay);
+    bigtime_t windowEnd = windowStart + BufferDuration();
+    uint32 last = 0;
+    MidiTimedEvent ev;
+    while (rt_ringbuffer_peek(port.midiRing, (char *)&ev, sizeof ev) == sizeof ev) {
+        if (ev.time >= windowEnd)
+            break;
+        rt_ringbuffer_read_advance(port.midiRing, sizeof ev);
+        if (m->count >= (uint32)kMidiMaxEvents)
+            continue; // a full buffer drops the rest of this period's events
+        uint32 offset = 0;
+        if (ev.time > windowStart)
+            offset = (uint32)((ev.time - windowStart) * (double)fRate / 1000000.0);
+        if (offset >= (uint32)fPeriod)
+            offset = (uint32)fPeriod - 1;
+        if (offset < last)
+            offset = last; // in time order, as the engine expects
+        last = offset;
+        uint32 i = m->count++;
+        memcpy(m->data[i], ev.data, ev.size);
+        m->events[i].time = offset;
+        m->events[i].size = ev.size;
+        m->events[i].buffer = m->data[i];
+    }
+}
+
+/* Hand this cycle's MIDI output to the writer thread, each event stamped with
+ * the real time its frame plays. */
+void JdMediaNode::_SendMidi(bigtime_t performanceTime)
+{
+    bool any = false;
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        Port &port = fPorts[p];
+        if (port.type != JD_PORT_MIDI || port.direction != JD_PORT_OUTPUT ||
+            !port.used.load(std::memory_order_acquire))
+            continue;
+        MidiBuffer *m = port.midi;
+        for (uint32 i = 0; i < m->count && port.midiRing; i++) {
+            MidiTimedEvent ev = {};
+            bigtime_t at =
+                performanceTime + (bigtime_t)(m->events[i].time * 1000000.0 / (double)fRate);
+            ev.time = TimeSource()->RealTimeFor(at, 0);
+            ev.size = (uint8)m->events[i].size;
+            memcpy(ev.data, m->data[i], ev.size);
+            if (rt_ringbuffer_write_space(port.midiRing) >= sizeof ev) {
+                rt_ringbuffer_write(port.midiRing, (const char *)&ev, sizeof ev);
+                any = true;
+            }
+        }
+        m->count = 0; // sent once, even if the engine writes nothing next cycle
+    }
+    // Wakes the writer without waiting or rescheduling.
+    if (any && gMidiSem >= 0)
+        release_sem_etc(gMidiSem, 1, B_DO_NOT_RESCHEDULE);
+}
+
+void JdMediaNode::_SendOutputs(bigtime_t performanceTime)
+{
+    for (int32 j = 0; j < kMaxJacks; j++) {
+        Jack &jk = fJacks[j];
+        if (!jk.active.load())
+            continue;
+        const float *chan[2] = {NULL, NULL};
+        for (int32 c = 0; c < jk.channels; c++) {
+            int32 slot = jk.portSlot[c].load(std::memory_order_acquire);
+            if (slot >= 0 && fPorts[slot].used.load(std::memory_order_acquire))
+                chan[c] = fPorts[slot].audio;
+        }
+        for (int32 k = 0; k < kMaxOutConns; k++) {
+            OutConn &o = jk.conns[k];
+            if (!o.connected || !o.enabled || !o.group)
+                continue;
+            // Never wait on a full port. SendBuffer would block this thread,
+            // which also reads our own port, for up to 15 s. A consumer that
+            // is busy (multi_audio restarting its streams for a new length)
+            // can at the same time be sending us its request for that length
+            // while our port fills with its capture buffers: each then waits
+            // for the other until the timeout. This cycle's buffer for it is
+            // dropped instead.
+            if (o.portCapacity > 0) {
+                ssize_t queued = port_count(o.output.destination.port);
+                if (queued >= 0 && queued > o.portCapacity - kPortHeadroom) {
+                    gDiag.portFull.fetch_add(1, std::memory_order_relaxed);
+                    notify_xrun();
+                    continue;
+                }
+            }
+            const media_raw_audio_format &a = o.output.format.u.raw_audio;
+            size_t ss = sample_size(a.format);
+            size_t bytes = (size_t)fPeriod * jk.channels * ss; // <= a.buffer_size
+            BBuffer *buf = o.group->RequestBuffer(bytes, 0);   // never wait
+            if (!buf) {
+                gDiag.noBuffer.fetch_add(1, std::memory_order_relaxed);
+                notify_xrun();
+                continue;
+            }
+            char *dst = (char *)buf->Data();
+            for (int32 f = 0; f < fPeriod; f++)
+                for (int32 c = 0; c < jk.channels; c++, dst += ss)
+                    write_sample(dst, a.format, chan[c] ? chan[c][f] : 0.0f);
+            media_header *h = buf->Header();
+            h->type = B_MEDIA_RAW_AUDIO;
+            h->size_used = bytes;
+            h->time_source = TimeSource()->ID();
+            h->start_time = performanceTime;
+            if (gDiagOn) {
+                if (j == 0) {
+                    float peak = 0.0f;
+                    for (int32 c = 0; c < jk.channels; c++)
+                        for (int32 f = 0; chan[c] && f < fPeriod; f++)
+                            peak = fmaxf(peak, fabsf(chan[c][f]));
+                    int32 milli = (int32)(peak * 1000.0f);
+                    if (milli > gDiag.peakMilli.load(std::memory_order_relaxed))
+                        gDiag.peakMilli.store(milli, std::memory_order_relaxed);
+                }
+                int32 lead = (int32)(performanceTime - TimeSource()->Now());
+                if (lead < gDiag.minLeadUs.load(std::memory_order_relaxed))
+                    gDiag.minLeadUs.store(lead, std::memory_order_relaxed);
+            }
+            if (SendBuffer(buf, o.output.source, o.output.destination) != B_OK) {
+                gDiag.sendFail.fetch_add(1, std::memory_order_relaxed);
+                buf->Recycle();
+            } else {
+                gDiag.sent.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
+// ---- jacks for output ports ----
+
+/* The jacks and channels an output port feeds, from its name; returns how
+ * many (up to 2). out_N -> the mono jack "Out N" (jack N), as JACK's port,
+ * and out_1/out_2 also -> the stereo "Master" (jack 0) that goes to the
+ * system mixer; "metronome" -> the Metronome jack. Other names feed none. */
+int32 jacks_for_port(const char *shortName, int32 jack[2], int32 channel[2])
+{
+    unsigned n;
+    char tail;
+    if (sscanf(shortName, "out_%u%c", &n, &tail) == 1 && n >= 1 && n <= (unsigned)kMaxOutPorts) {
+        jack[0] = (int32)n;
+        channel[0] = 0;
+        if (n > 2)
+            return 1;
+        jack[1] = 0;
+        channel[1] = (int32)n - 1;
+        return 2;
+    }
+    if (strcmp(shortName, "metronome") == 0) {
+        jack[0] = kMetronomeJack;
+        channel[0] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+void setup_jacks(JdMediaNode *node)
+{
+    for (int32 j = 0; j < kMaxJacks; j++) {
+        Jack &jk = node->fJacks[j];
+        if (j == kMetronomeJack) {
+            snprintf(jk.name, sizeof jk.name, "Metronome");
+            jk.channels = 1;
+        } else if (j == 0) {
+            snprintf(jk.name, sizeof jk.name, "Master");
+            jk.channels = 2;
+        } else {
+            snprintf(jk.name, sizeof jk.name, "Out %d", (int)j);
+            jk.channels = 1;
+        }
+    }
+}
+
+// ---- capture sources ----
+
+struct CaptureSource {
+    char name[192];
+    media_node node; // the producer
+    media_output output;
+    int32 channel;
+    int32 input; // >= 0: an existing input of ours (patched in Cortex)
+    bool app;    // an application's output, not hardware or the system mixer
+};
+
+/* Hardware capture channels (every audio output of every physical-input
+ * node), then the audio outputs of applications (MediaPlayer, another DAW)
+ * and the system mixer's free output, as JACK lists every client's ports;
+ * then the channels of inputs patched into Kasen from anything else.
+ * Non-RT. */
+int32 find_input_from(const media_source &source);
+void give_back_to_mixer(BMediaRoster *roster, const media_source &source,
+                        const media_format &format);
+
+void list_capture_sources(std::vector<CaptureSource> &out)
+{
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (!roster || !gNode)
+        return;
+    media_node mixer;
+    media_node_id mixerID = -1;
+    if (roster->GetAudioMixer(&mixer) == B_OK) {
+        mixerID = mixer.node;
+        roster->ReleaseNode(mixer);
+    }
+    live_node_info all[64];
+    int32 allCount = 64;
+    if (roster->GetLiveNodes(all, &allCount, NULL, NULL, NULL, B_BUFFER_PRODUCER) != B_OK)
+        allCount = 0;
+    // Hardware first, then the rest, each in the roster's order.
+    std::vector<live_node_info> nodes;
+    for (int pass = 0; pass < 2; pass++)
+        for (int32 n = 0; n < allCount; n++)
+            if (((all[n].node.kind & B_PHYSICAL_INPUT) != 0) == (pass == 0))
+                nodes.push_back(all[n]);
+    int32 count = (int32)nodes.size();
+    {
+        for (int32 n = 0; n < count; n++) {
+            if (nodes[n].node.node == gNode->ID())
+                continue;
+            bool hardware = (nodes[n].node.kind & B_PHYSICAL_INPUT) != 0;
+            bool isMixer = nodes[n].node.node == mixerID;
+            // Two MediaPlayer windows are two nodes of the same name: the
+            // second is "MediaPlayer audio out #2".
+            char label[B_MEDIA_NAME_LENGTH + 16];
+            int32 same = 0;
+            for (int32 m = 0; m < n; m++)
+                if (strcmp(nodes[m].name, nodes[n].name) == 0)
+                    same++;
+            if (same > 0)
+                snprintf(label, sizeof label, "%s #%d", nodes[n].name, (int)(same + 1));
+            else
+                snprintf(label, sizeof label, "%s", nodes[n].name);
+            std::vector<media_output> outs(32);
+            int32 nouts = 0;
+            status_t err;
+            // It fills at most the given count and says how many it filled,
+            // so a full buffer may mean more.
+            while ((err = roster->GetAllOutputsFor(nodes[n].node, outs.data(), (int32)outs.size(),
+                                                   &nouts)) == B_OK &&
+                   nouts >= (int32)outs.size() && outs.size() < 4096)
+                outs.resize(outs.size() * 2);
+            if (err != B_OK)
+                continue;
+            nouts = std::min(nouts, (int32)outs.size());
+
+            // A node may offer an output again for each connection, under
+            // the same name (multi_audio with a jack per channel does). List
+            // each name once: the one connected to us, else a free one, so
+            // the name a track keeps always means one output.
+            std::vector<int32> chosen;
+            {
+                BAutolock lock(gNode->fInputLock);
+                for (int32 o = 0; o < nouts; o++) {
+                    size_t c = 0;
+                    while (c < chosen.size() &&
+                           strncmp(outs[chosen[c]].name, outs[o].name, B_MEDIA_NAME_LENGTH) != 0)
+                        c++;
+                    if (c == chosen.size()) {
+                        chosen.push_back(o);
+                        continue;
+                    }
+                    const media_output &had = outs[chosen[c]];
+                    bool hadOurs = find_input_from(had.source) >= 0;
+                    bool hadFree = had.destination == media_destination::null;
+                    if (hadOurs)
+                        continue;
+                    if (find_input_from(outs[o].source) >= 0 ||
+                        (!hadFree && outs[o].destination == media_destination::null))
+                        chosen[c] = o;
+                }
+            }
+
+            for (size_t k = 0; k < chosen.size(); k++) {
+                int32 o = chosen[k];
+                const media_format &f = outs[o].format;
+                if (f.type != B_MEDIA_RAW_AUDIO && f.type != B_MEDIA_UNKNOWN_TYPE)
+                    continue;
+                // The system mixer's outputs in use feed the speakers; only
+                // its free one is offered (a new output of the system mix).
+                if (isMixer && outs[o].destination != media_destination::null) {
+                    BAutolock lock(gNode->fInputLock);
+                    if (find_input_from(outs[o].source) < 0)
+                        continue;
+                }
+                int32 ch = (int32)f.u.raw_audio.channel_count;
+                if (ch < 1 || ch > kMaxInChannels)
+                    ch = 2;
+                for (int32 c = 0; c < ch; c++) {
+                    CaptureSource s;
+                    // "MediaPlayer audio out / 1" when the output is named
+                    // after its node, as apps' are.
+                    if (strncmp(nodes[n].name, outs[o].name, B_MEDIA_NAME_LENGTH) == 0)
+                        snprintf(s.name, sizeof s.name, "%s%s / %d", kCapturePrefix, label,
+                                 (int)(c + 1));
+                    else
+                        snprintf(s.name, sizeof s.name, "%s%s / %s / %d", kCapturePrefix, label,
+                                 outs[o].name, (int)(c + 1));
+                    s.node = nodes[n].node;
+                    s.output = outs[o];
+                    s.channel = c;
+                    s.input = -1;
+                    s.app = !hardware && !isMixer;
+                    out.push_back(s);
+                }
+            }
+        }
+    }
+
+    // Inputs connected from elsewhere (not one of the outputs listed above).
+    BAutolock lock(gNode->fInputLock);
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        const Input &in = gNode->fInputs[i];
+        if (!in.connected)
+            continue;
+        bool listed = false;
+        for (size_t k = 0; k < out.size() && !listed; k++)
+            listed = out[k].output.source == in.input.source;
+        if (listed)
+            continue;
+        for (int32 c = 0; c < in.channels; c++) {
+            CaptureSource s;
+            snprintf(s.name, sizeof s.name, "%s%s %s / %d", kCapturePrefix, gNodeName,
+                     in.input.name, (int)(c + 1));
+            s.channel = c;
+            s.input = i;
+            s.app = false;
+            out.push_back(s);
+        }
+    }
+}
+
+int32 find_input_from(const media_source &source)
+{
+    for (int32 i = 0; i < kMaxInputs; i++)
+        if (gNode->fInputs[i].connected && gNode->fInputs[i].input.source == source)
+            return i;
+    return -1;
+}
+
+Port *port_by_full_name(const char *name)
+{
+    if (!gNode || !name)
+        return NULL;
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        Port &port = gNode->fPorts[p];
+        if (port.used.load(std::memory_order_acquire) && strcmp(port.fullName, name) == 0)
+            return &port;
+    }
+    return NULL;
+}
+
+/* The format of the system mixer's (first) output: the hardware's rate and
+ * buffer length. */
+bool mixer_output_format(BMediaRoster *roster, float *rate, int32 *period,
+                         port_id *mixerPort = NULL)
+{
+    media_node mixer;
+    if (roster->GetAudioMixer(&mixer) != B_OK)
+        return false;
+    if (mixerPort)
+        *mixerPort = mixer.port;
+    media_output out;
+    int32 n = 0;
+    bool ok = roster->GetConnectedOutputsFor(mixer, &out, 1, &n) == B_OK && n == 1;
+    roster->ReleaseNode(mixer);
+    if (!ok)
+        return false;
+    const media_raw_audio_format &a = out.format.u.raw_audio;
+    size_t frame = sample_size(a.format) * a.channel_count;
+    if (a.frame_rate <= 0 || frame == 0 || a.buffer_size < frame)
+        return false;
+    *rate = a.frame_rate;
+    *period = (int32)(a.buffer_size / frame);
+    return true;
+}
+
+/* The sound card that runs the clock, as JACK's driver: the system time
+ * source when it is a hardware output (media_server makes the default output
+ * the time source), else the default audio output. Release it. */
+bool playback_card(BMediaRoster *roster, media_node *card)
+{
+    const uint32 kinds = B_BUFFER_CONSUMER | B_PHYSICAL_OUTPUT;
+    if (roster->GetTimeSource(card) == B_OK) {
+        if ((card->kind & kinds) == kinds)
+            return true;
+        roster->ReleaseNode(*card);
+    }
+    if (roster->GetAudioOutput(card) == B_OK) {
+        if ((card->kind & kinds) == kinds)
+            return true;
+        roster->ReleaseNode(*card);
+    }
+    return false;
+}
+
+/* The card's mono playback jacks ("playback 1", ...), each name once, in
+ * channel order; a free one for each where there is one. */
+void playback_inputs(BMediaRoster *roster, const media_node &card, std::vector<media_input> &inputs)
+{
+    std::vector<media_input> all(64);
+    int32 n = 0;
+    status_t err;
+    while ((err = roster->GetAllInputsFor(card, all.data(), (int32)all.size(), &n)) == B_OK &&
+           n >= (int32)all.size() && all.size() < 4096)
+        all.resize(all.size() * 2);
+    if (err != B_OK)
+        return;
+    n = std::min(n, (int32)all.size());
+    for (int32 i = 0; i < n; i++) {
+        const media_format &f = all[i].format;
+        if (f.type != B_MEDIA_RAW_AUDIO || f.u.raw_audio.channel_count != 1)
+            continue;
+        size_t k = 0;
+        while (k < inputs.size() && strcmp(inputs[k].name, all[i].name) != 0)
+            k++;
+        if (k == inputs.size())
+            inputs.push_back(all[i]);
+        else if (inputs[k].source != media_source::null && all[i].source == media_source::null)
+            inputs[k] = all[i];
+    }
+    // "playback 10" after "playback 9".
+    std::stable_sort(inputs.begin(), inputs.end(), [](const media_input &a, const media_input &b) {
+        size_t la = strlen(a.name), lb = strlen(b.name);
+        return la != lb ? la < lb : strcmp(a.name, b.name) < 0;
+    });
+}
+
+/* The rate and period of the card that runs the clock (see playback_card),
+ * from the format its playback jacks take: multi_audio only takes its
+ * driver's own rate and buffer length. */
+bool card_format(BMediaRoster *roster, float *rate, int32 *period)
+{
+    media_node card;
+    if (!playback_card(roster, &card))
+        return false;
+    std::vector<media_input> ins(64);
+    int32 n = 0;
+    if (roster->GetAllInputsFor(card, ins.data(), (int32)ins.size(), &n) != B_OK)
+        n = 0;
+    roster->ReleaseNode(card);
+    n = std::min(n, (int32)ins.size());
+    // A jack with every field first; an idle multi_audio leaves the sample
+    // format of its mono jacks open, sized for 4-byte samples.
+    for (int pass = 0; pass < 2; pass++) {
+        for (int32 i = 0; i < n; i++) {
+            if (ins[i].format.type != B_MEDIA_RAW_AUDIO)
+                continue;
+            const media_raw_audio_format &a = ins[i].format.u.raw_audio;
+            size_t ss = sample_size(a.format);
+            if (ss == 0 && pass == 0)
+                continue;
+            if (ss == 0)
+                ss = 4;
+            size_t frame = ss * a.channel_count;
+            if (a.frame_rate <= 0 || frame == 0 || a.buffer_size < frame)
+                continue;
+            *rate = a.frame_rate;
+            *period = (int32)(a.buffer_size / frame);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The live node whose control port is `port` (media_node carries it), or -1. */
+media_node_id node_for_port(BMediaRoster *roster, port_id port)
+{
+    live_node_info nodes[64];
+    int32 count = 64;
+    if (roster->GetLiveNodes(nodes, &count) != B_OK)
+        return -1;
+    for (int32 i = 0; i < count; i++)
+        if (nodes[i].node.port == port)
+            return nodes[i].node.node;
+    return -1;
+}
+
+/* Undo connections from hardware capture outputs to consumers that are gone.
+ * A node whose team died (a crash, or a kill) never disconnects, so
+ * multi_audio keeps the output reserved for it and refuses every new
+ * connection ("Already connected"). A consumer's destination port is its
+ * control port, which goes away with the team, so a dead port means a dead
+ * consumer. BMediaRoster::Disconnect only needs the producer's side for this
+ * (it queries the producer and consumer ports separately, MediaRoster.cpp). */
+void release_dead_capture_connections(BMediaRoster *roster)
+{
+    live_node_info nodes[64];
+    int32 count = 64;
+    if (roster->GetLiveNodes(nodes, &count, NULL, NULL, NULL, B_PHYSICAL_INPUT) != B_OK)
+        return;
+    for (int32 n = 0; n < count; n++) {
+        media_output outs[16];
+        int32 nouts = 0;
+        if (roster->GetConnectedOutputsFor(nodes[n].node, outs, 16, &nouts) != B_OK)
+            continue;
+        for (int32 o = 0; o < nouts; o++) {
+            port_info info;
+            if (get_port_info(outs[o].destination.port, &info) == B_OK)
+                continue; // the consumer is alive
+            // The consumer's node id is unknown (the node is gone); any valid
+            // id gets the producer side disconnected.
+            // The consumer half of this always fails (its port is gone), so
+            // the result says nothing; the producer side is what frees it.
+            roster->Disconnect(nodes[n].node.node, outs[o].source, nodes[n].node.node,
+                               outs[o].destination);
+            fprintf(stderr, "%s media: released %s / %s from a consumer that is gone\n", gNodeName,
+                    nodes[n].name, outs[o].name);
+        }
+    }
+}
+
+/* Connect one of our jacks' free outputs to the free input `in`. */
+status_t connect_jack_to(BMediaRoster *roster, int32 jack, const media_input &in)
+{
+    std::vector<media_output> outs(kMaxJacks * kMaxOutConns);
+    int32 n = 0;
+    if (roster->GetFreeOutputsFor(gNode->Node(), outs.data(), (int32)outs.size(), &n) != B_OK)
+        return B_ERROR;
+    const media_output *free = NULL;
+    for (int32 i = 0; i < n && !free; i++)
+        if (outs[i].source.id / kMaxOutConns == jack)
+            free = &outs[i];
+    if (!free)
+        return B_BUSY;
+    media_format fmt;
+    fmt.type = B_MEDIA_RAW_AUDIO;
+    fmt.u.raw_audio = media_raw_audio_format::wildcard;
+    fmt.u.raw_audio.frame_rate = gNode->Rate();
+    fmt.u.raw_audio.channel_count = gNode->fJacks[jack].channels;
+    media_output madeOut;
+    media_input madeIn;
+    return roster->Connect(free->source, in.destination, &fmt, &madeOut, &madeIn);
+}
+
+/* The engine's name for a playback jack of the card: "media:<card> /
+ * <jack>", as get_ports lists it. */
+void playback_name(const char *card, const media_input &in, char *name, size_t size)
+{
+    snprintf(name, size, "%s%s / %s", kCapturePrefix, card, in.name);
+}
+
+/* Connect (or disconnect) output port `port` to (from) the card's playback
+ * jack named `destination` (as get_ports gives it), as jack_connect does
+ * from out_N to system:playback_N. 0 = ok (already so counts). Non-RT. */
+int connect_playback(Port *port, const char *destination, bool connect)
+{
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    int32 j[2], c[2];
+    if (!roster || jacks_for_port(port->shortName, j, c) < 1)
+        return -1;
+    int32 jack = j[0]; // its own mono jack (Out N, Metronome)
+    media_node card;
+    if (!playback_card(roster, &card))
+        return -1;
+    live_node_info info;
+    int result = -1;
+    if (roster->GetLiveNodeInfo(card, &info) == B_OK) {
+        // Is the jack already connected to it? (Our output's source id says
+        // which jack it is.)
+        std::vector<media_input> ins(256);
+        int32 n = 0;
+        if (roster->GetConnectedInputsFor(card, ins.data(), (int32)ins.size(), &n) != B_OK)
+            n = 0;
+        n = std::min(n, (int32)ins.size());
+        char name[256];
+        bool done = false;
+        for (int32 i = 0; i < n; i++) {
+            playback_name(info.name, ins[i], name, sizeof name);
+            if (strcmp(name, destination) != 0 || ins[i].source.port != gNode->ControlPort() ||
+                ins[i].source.id / kMaxOutConns != jack)
+                continue;
+            if (connect) {
+                result = 0;
+            } else {
+                result = roster->Disconnect(gNode->ID(), ins[i].source, card.node,
+                                            ins[i].destination) == B_OK
+                             ? 0
+                             : -1;
+            }
+            done = true;
+            break;
+        }
+        if (!done && !connect)
+            result = 0;
+        if (!done && connect) {
+            std::vector<media_input> frees(256);
+            n = 0;
+            if (roster->GetFreeInputsFor(card, frees.data(), (int32)frees.size(), &n,
+                                         B_MEDIA_RAW_AUDIO) != B_OK)
+                n = 0;
+            n = std::min(n, (int32)frees.size());
+            status_t err = B_NAME_NOT_FOUND;
+            for (int32 i = 0; i < n; i++) {
+                playback_name(info.name, frees[i], name, sizeof name);
+                if (strcmp(name, destination) == 0) {
+                    err = connect_jack_to(roster, jack, frees[i]);
+                    break;
+                }
+            }
+            if (err == B_OK)
+                result = 0;
+            else
+                fprintf(stderr, "%s media: connecting %s to %s failed: %s\n", gNodeName,
+                        port->shortName, destination, strerror(err));
+        }
+    }
+    roster->ReleaseNode(card);
+    return result;
+}
+
+/* Connect one of our jacks' free outputs to a free input of `consumer`. */
+status_t connect_jack(BMediaRoster *roster, int32 jack, const media_node &consumer)
+{
+    std::vector<media_output> outs(kMaxJacks * kMaxOutConns);
+    int32 n = 0;
+    if (roster->GetFreeOutputsFor(gNode->Node(), outs.data(), (int32)outs.size(), &n) != B_OK)
+        return B_ERROR;
+    const media_output *free = NULL;
+    for (int32 i = 0; i < n && !free; i++)
+        if (outs[i].source.id / kMaxOutConns == jack)
+            free = &outs[i];
+    if (!free)
+        return B_BUSY;
+    media_input in;
+    int32 nin = 0;
+    status_t err = roster->GetFreeInputsFor(consumer, &in, 1, &nin, B_MEDIA_RAW_AUDIO);
+    if (err != B_OK || nin < 1)
+        return err != B_OK ? err : B_BUSY;
+    media_format fmt;
+    fmt.type = B_MEDIA_RAW_AUDIO;
+    fmt.u.raw_audio = media_raw_audio_format::wildcard;
+    fmt.u.raw_audio.frame_rate = gNode->Rate();
+    fmt.u.raw_audio.channel_count = gNode->fJacks[jack].channels;
+    media_output madeOut;
+    media_input madeIn;
+    return roster->Connect(free->source, in.destination, &fmt, &madeOut, &madeIn);
+}
+
+/* The system mixer's output may have a new buffer length: tell the node,
+ * which decides on its own thread whether to follow it. Runs on the watcher
+ * (which mk_close stops before the node goes away). */
+void check_mixer_period()
+{
+    gCheckQueued.store(0, std::memory_order_release);
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (!gNode || !roster)
+        return;
+    FollowMixer m;
+    if (!mixer_output_format(roster, &m.rate, &m.period, &m.mixerPort))
+        return;
+    if (m.period == gNode->Period())
+        return;
+    write_port_etc(gNode->ControlPort(), kFollowMixerCode, &m, sizeof m, B_RELATIVE_TIMEOUT,
+                   500000);
+}
+
+/* KASEN_DIAG: what the node did in the last 2 s. Runs on the watcher. */
+void print_diag()
+{
+    if (!gNode)
+        return;
+    int32 lead = gDiag.minLeadUs.exchange(INT32_MAX, std::memory_order_relaxed);
+    fprintf(stderr,
+            "%s media: cycles %d, sent %d, send failed %d, no buffer %d, port full %d, late "
+            "notices %d (max %d us), late wakes %d, master peak %.3f, least lead %d us, event "
+            "latency %lld us\n",
+            gNodeName, (int)gNode->fCycles.load(), (int)gDiag.sent.exchange(0),
+            (int)gDiag.sendFail.exchange(0), (int)gDiag.noBuffer.exchange(0),
+            (int)gDiag.portFull.exchange(0), (int)gDiag.lateNotes.exchange(0),
+            (int)gDiag.lateUs.exchange(0), (int)gDiag.lateWake.exchange(0),
+            gDiag.peakMilli.exchange(0) / 1000.0, lead == INT32_MAX ? -1 : (int)lead,
+            (long long)gNode->CurrentEventLatency());
+
+    int32 capIn = gDiag.capInput.load(std::memory_order_relaxed);
+    if (capIn < 0)
+        return;
+    // Two rates against the capture's frame count, in parts per million:
+    // its own stamps (positive: the stamps run ahead of the frames, i.e.
+    // buffers are missing or short), and our cycle (positive: we consume
+    // faster than it delivers, so the input runs dry now and then).
+    double rate = gNode->Rate();
+    double frames = (double)gDiag.capFrames.load(std::memory_order_relaxed);
+    double span = (double)gDiag.capSpanUs.load(std::memory_order_relaxed);
+    double cycleFrames =
+        (double)(gNode->fCycles.load() - gDiag.capCycles0.load(std::memory_order_relaxed)) *
+        gNode->Period();
+    double stampPpm = span > 0 ? (span - frames * 1e6 / rate) / span * 1e6 : 0;
+    double cyclePpm = frames > 0 ? (cycleFrames - frames) / frames * 1e6 : 0;
+    fprintf(stderr,
+            "%s capture in %d: buffers %d, stamp gaps %d (largest step %d us), ran dry %d; "
+            "over %.1f s: stamps %+.1f ppm vs frames, cycle %+.1f ppm vs capture "
+            "(%+.0f frames); offset %d..%d frames, reported %d%s\n",
+            gNodeName, (int)capIn, (int)gDiag.capBufs.exchange(0), (int)gDiag.capGaps.exchange(0),
+            (int)gDiag.capMaxStepUs.exchange(0), (int)gDiag.capDry.exchange(0), span / 1e6,
+            stampPpm, cyclePpm, cycleFrames - frames, (int)gDiag.capLatMin.exchange(INT32_MAX),
+            (int)gDiag.capLatMax.exchange(0),
+            (int)gNode->fInputs[capIn].latencyFrames.load(std::memory_order_relaxed),
+            gHoldLatency.load(std::memory_order_relaxed) ? " (held)" : "");
+}
+
+// ---- MIDI: writer thread and endpoints ----
+
+/* Sprays every MIDI output port's ring. Woken by the cycle (release_sem_etc)
+ * and every 100 ms to see whether to quit. */
+int32 midi_writer_thread(void *)
+{
+    while (!gMidiQuit.load(std::memory_order_acquire)) {
+        acquire_sem_etc(gMidiSem, 1, B_RELATIVE_TIMEOUT, 100000);
+        if (!gNode)
+            continue;
+        for (int32 p = 0; p < kMaxPorts; p++) {
+            Port &port = gNode->fPorts[p];
+            if (port.type != JD_PORT_MIDI || port.direction != JD_PORT_OUTPUT || !port.midiRing ||
+                !port.midiOut)
+                continue;
+            MidiTimedEvent ev;
+            while (rt_ringbuffer_read(port.midiRing, (char *)&ev, sizeof ev) == sizeof ev)
+                port.midiOut->SprayData(ev.data, ev.size, true, ev.time);
+        }
+    }
+    return 0;
+}
+
+/* The display name of a MIDI port's endpoint, from the engine's short name. */
+void midi_endpoint_name(const char *shortName, char *name, size_t len)
+{
+    unsigned n;
+    if (sscanf(shortName, "midi_in_%u", &n) == 1)
+        snprintf(name, len, "%s MIDI in %u", gNodeName, n);
+    else if (sscanf(shortName, "midi_out_%u", &n) == 1)
+        snprintf(name, len, "%s MIDI out %u", gNodeName, n);
+    else if (strcmp(shortName, "control_in") == 0)
+        snprintf(name, len, "%s control in", gNodeName);
+    else
+        snprintf(name, len, "%s %s", gNodeName, shortName);
+}
+
+/* Another app's (or midi_server's hardware) endpoint named `name` (with or
+ * without kMidiPrefix), acquired; Release() it. Ours are local and skipped. */
+BMidiEndpoint *find_remote_endpoint(const char *name, bool producer)
+{
+    if (!name)
+        return NULL;
+    if (strncmp(name, kMidiPrefix, strlen(kMidiPrefix)) == 0)
+        name += strlen(kMidiPrefix);
+    int32 id = 0;
+    while (BMidiEndpoint *e = producer ? (BMidiEndpoint *)BMidiRoster::NextProducer(&id)
+                                       : (BMidiEndpoint *)BMidiRoster::NextConsumer(&id)) {
+        if (e->IsRemote() && strcmp(e->Name(), name) == 0)
+            return e;
+        e->Release();
+    }
+    return NULL;
+}
+
+/* Disconnect a port's endpoint from every other endpoint. Non-RT. */
+void midi_disconnect_all(Port &port)
+{
+    int32 id = 0;
+    if (port.midiIn) {
+        while (BMidiProducer *p = BMidiRoster::NextProducer(&id)) {
+            if (p->IsConnected(port.midiIn))
+                p->Disconnect(port.midiIn);
+            p->Release();
+        }
+    }
+    if (port.midiOut) {
+        BList *conns = port.midiOut->Connections(); // acquired consumers, ours to free
+        for (int32 i = 0; conns && i < conns->CountItems(); i++) {
+            BMidiConsumer *c = (BMidiConsumer *)conns->ItemAt(i);
+            port.midiOut->Disconnect(c);
+            c->Release();
+        }
+        delete conns;
+    }
+}
+
+// ---- the JdBackend table ----
+
+int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, char *err,
+            size_t errLen)
+{
+    if (gNode)
+        return 0;
+    if (clientName && *clientName)
+        snprintf(gClientPrefix, sizeof gClientPrefix, "%s:", clientName);
+    if (!BMediaRoster::IsRunning()) {
+        snprintf(err, errLen,
+                 "The media services are not running.\n"
+                 "Start them from the Media preferences, then try again.");
+        return -1;
+    }
+    status_t status;
+    BMediaRoster *roster = BMediaRoster::Roster(&status);
+    if (!roster || status != B_OK) {
+        snprintf(err, errLen, "Could not reach the media services: %s.", strerror(status));
+        return -1;
+    }
+    release_dead_capture_connections(roster);
+
+    // The card's rate and period, as JACK runs at its driver's; the system
+    // mixer's output (the same card's, when it is connected) otherwise.
+    float rate = 48000.0f;
+    int32 period = 512;
+    if (!card_format(roster, &rate, &period) && !mixer_output_format(roster, &rate, &period))
+        fprintf(stderr, "%s: no sound card or system mixer output; using %.0f Hz, %d frames\n",
+                gNodeName, rate, (int)period);
+    if (period < 16 || period > 16384) {
+        snprintf(err, errLen, "The system mixer's buffer length (%d frames) is not usable.",
+                 (int)period);
+        return -1;
+    }
+
+    if (cb)
+        gCb = *cb;
+    else
+        memset(&gCb, 0, sizeof gCb);
+    gArg = arg;
+
+    gNode = new (std::nothrow) JdMediaNode(rate, period);
+    if (!gNode) {
+        snprintf(err, errLen, "Out of memory.");
+        return -1;
+    }
+    setup_jacks(gNode);
+    status = roster->RegisterNode(gNode);
+    if (status != B_OK) {
+        snprintf(err, errLen, "Could not register the %s media node: %s.", gNodeName,
+                 strerror(status));
+        gNode->Release();
+        gNode = NULL;
+        return -1;
+    }
+    media_node ts;
+    if (roster->GetTimeSource(&ts) == B_OK) {
+        roster->SetTimeSourceFor(gNode->ID(), ts.node);
+        roster->ReleaseNode(ts);
+    }
+
+    gMidiQuit.store(0);
+    gMidiSem = create_sem(0, "media node MIDI out");
+    if (gMidiSem >= 0) {
+        gMidiThread =
+            spawn_thread(midi_writer_thread, "media node MIDI writer", B_URGENT_PRIORITY, NULL);
+        if (gMidiThread >= 0)
+            resume_thread(gMidiThread);
+    }
+
+    gWatcher = new (std::nothrow) RosterWatcher();
+    if (gWatcher) {
+        gWatcher->Run();
+        gNode->fWatcher = BMessenger(gWatcher);
+        roster->StartWatching(BMessenger(gWatcher));
+        // The server's own quit notice only goes to watchers that ask for it
+        // by name (BMediaRoster::StartWatching, MediaRoster.cpp).
+        roster->StartWatching(BMessenger(gWatcher), B_MEDIA_SERVER_QUIT);
+        BMessenger watcher(gWatcher);
+        BMidiRoster::StartWatching(&watcher);
+        const char *diag = getenv("KASEN_DIAG");
+        gDiagOn = diag && *diag && strcmp(diag, "0") != 0;
+        if (gDiagOn) {
+            BMessage report(MSG_DIAG_REPORT);
+            gWatcher->fDiagRunner =
+                new (std::nothrow) BMessageRunner(BMessenger(gWatcher), &report, 2000000);
+        }
+    }
+    return 0;
+}
+
+const char **mk_get_ports(int type, int flags);
+void mk_free_ports(const char **ports);
+
+int mk_activate(void)
+{
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (!gNode || !roster)
+        return -1;
+
+    // Out 1 and Out 2 (and the Metronome) go straight to the card's playback
+    // 1 and 2, as JACK connects them to system:playback_1/2; the system mixer
+    // is not in the way. Only without a card at our rate do the Master and
+    // Metronome go to the system mixer instead. The Metronome only if a
+    // "metronome" port was registered before this (Kasen's is); a host
+    // without one leaves no silent wire.
+    bool direct = false;
+    if (const char **playback = mk_get_ports(JD_PORT_AUDIO, JD_PORT_INPUT | JD_PORT_PHYSICAL)) {
+        for (int32 p = 0; p < kMaxPorts; p++) {
+            Port &port = gNode->fPorts[p];
+            if (!port.used.load(std::memory_order_acquire) || port.type != JD_PORT_AUDIO ||
+                port.direction != JD_PORT_OUTPUT)
+                continue;
+            int32 to[2] = {-1, -1};
+            if (strcmp(port.shortName, "out_1") == 0)
+                to[0] = 0;
+            else if (strcmp(port.shortName, "out_2") == 0)
+                to[0] = 1;
+            else if (strcmp(port.shortName, "metronome") == 0)
+                to[0] = 0, to[1] = 1;
+            for (int k = 0; k < 2; k++) {
+                if (to[k] < 0 || !playback[0] || (to[k] == 1 && !playback[1]))
+                    continue;
+                if (connect_playback(&port, playback[to[k]], true) == 0 && port.shortName[0] == 'o')
+                    direct = true;
+            }
+        }
+        mk_free_ports(playback);
+    }
+    media_node mixer;
+    if (roster->GetAudioMixer(&mixer) == B_OK) {
+        gNode->fMixerPort.store(mixer.port, std::memory_order_relaxed);
+        roster->ReleaseNode(mixer);
+    }
+    if (!direct && roster->GetAudioMixer(&mixer) == B_OK) {
+        status_t e1 = connect_jack(roster, 0, mixer);
+        status_t e2 = B_OK;
+        if (gNode->fJacks[kMetronomeJack].active.load(std::memory_order_acquire))
+            e2 = connect_jack(roster, kMetronomeJack, mixer);
+        if (e1 != B_OK || e2 != B_OK)
+            fprintf(stderr, "%s: connecting to the system mixer: master %s, metronome %s\n",
+                    gNodeName, strerror(e1), strerror(e2));
+        roster->ReleaseNode(mixer);
+    }
+
+    BTimeSource *ts = roster->MakeTimeSourceFor(gNode->Node());
+    if (!ts)
+        return -1;
+    bigtime_t latency = 0;
+    gNode->GetLatency(&latency);
+    status_t err = roster->StartNode(gNode->Node(), ts->Now() + latency + 1000);
+    ts->Release();
+    return err == B_OK ? 0 : -1;
+}
+
+void mk_close(void)
+{
+    if (!gNode)
+        return;
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (roster) {
+        if (gWatcher) {
+            roster->StopWatching(BMessenger(gWatcher), B_MEDIA_SERVER_QUIT);
+            roster->StopWatching(BMessenger(gWatcher));
+            BMidiRoster::StopWatching();
+        }
+        roster->StopNode(gNode->Node(), 0, true);
+
+        // Disconnect wants both node ids; a connection only names ports.
+        std::vector<media_output> outs(kMaxJacks * kMaxOutConns);
+        int32 n = 0;
+        if (roster->GetConnectedOutputsFor(gNode->Node(), outs.data(), (int32)outs.size(), &n) ==
+            B_OK) {
+            for (int32 i = 0; i < n; i++) {
+                media_node_id consumer = node_for_port(roster, outs[i].destination.port);
+                if (consumer > 0)
+                    roster->Disconnect(gNode->ID(), outs[i].source, consumer, outs[i].destination);
+            }
+        }
+        std::vector<media_input> ins(kMaxInputs);
+        n = 0;
+        if (roster->GetConnectedInputsFor(gNode->Node(), ins.data(), (int32)ins.size(), &n) ==
+            B_OK) {
+            for (int32 i = 0; i < n; i++) {
+                bool restore = false;
+                {
+                    BAutolock lock(gNode->fInputLock);
+                    int32 k = find_input_from(ins[i].source);
+                    restore = k >= 0 && gNode->fInputs[k].restoreToMixer;
+                    if (restore)
+                        ins[i].format = gNode->fInputs[k].restoreFormat;
+                }
+                media_node_id producer = node_for_port(roster, ins[i].source.port);
+                if (producer > 0 &&
+                    roster->Disconnect(producer, ins[i].source, gNode->ID(), ins[i].destination) ==
+                        B_OK &&
+                    restore)
+                    give_back_to_mixer(roster, ins[i].source, ins[i].format);
+            }
+        }
+    }
+    if (gWatcher) {
+        gWatcher->Lock();
+        gWatcher->Quit();
+        gWatcher = NULL;
+    }
+    // MIDI: off the roster and disconnected, so nothing reaches a consumer
+    // while it goes; then the writer stops (the node's destructor releases
+    // the endpoints and frees the rings).
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        Port &port = gNode->fPorts[p];
+        if (port.type != JD_PORT_MIDI || !port.used.load())
+            continue; // an unregistered port's endpoint is already off
+        midi_disconnect_all(port);
+        if (port.direction == JD_PORT_INPUT && port.midiIn)
+            port.midiIn->Unregister();
+        else if (port.direction == JD_PORT_OUTPUT && port.midiOut)
+            port.midiOut->Unregister();
+    }
+    if (gMidiThread >= 0) {
+        gMidiQuit.store(1, std::memory_order_release);
+        release_sem(gMidiSem);
+        status_t result;
+        wait_for_thread(gMidiThread, &result);
+        gMidiThread = -1;
+    }
+    if (gMidiSem >= 0) {
+        delete_sem(gMidiSem);
+        gMidiSem = -1;
+    }
+    // StopNode is asynchronous, so a cycle may still be running: the port
+    // buffers are freed by the node's destructor, after Quit() has waited
+    // for its control thread.
+    gNode->Release(); // unregisters and deletes it
+    gNode = NULL;
+    memset(&gCb, 0, sizeof gCb);
+}
+
+jd_nframes_t mk_sample_rate(void)
+{
+    return gNode ? (jd_nframes_t)lrintf(gNode->Rate()) : 0;
+}
+
+jd_nframes_t mk_buffer_size(void)
+{
+    return gNode ? (jd_nframes_t)gNode->Period() : 0;
+}
+
+/* The capture-source names (as list_capture_sources gives them) that the
+ * connection \a in carries into its port: "<prefix><node> / <output> / <n>"
+ * for the channel it feeds, and the form used for a connection from a node
+ * that is not hardware. Non-RT. */
+void input_source_names(BMediaRoster *roster, const media_source &source, const char *jackName,
+                        int32 channel, char *hardware, char *other, size_t size)
+{
+    (void)roster;
+    snprintf(other, size, "%s%s %s / %d", kCapturePrefix, gNodeName, jackName, (int)(channel + 1));
+    hardware[0] = '\0';
+    // The name the input list gives that output's channel.
+    std::vector<CaptureSource> srcs;
+    list_capture_sources(srcs);
+    for (size_t i = 0; i < srcs.size(); i++) {
+        if (srcs[i].input < 0 && srcs[i].output.source == source && srcs[i].channel == channel) {
+            strlcpy(hardware, srcs[i].name, size);
+            break;
+        }
+    }
+}
+
+/* Disconnects the connections made on capture port \a p's jack: all of
+ * them, or those that carry \a sourceName. Non-RT; not under fInputLock (our
+ * own Disconnected takes it on the control thread). */
+void disconnect_port_inputs(int32 p, const char *sourceName)
+{
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (!gNode || !roster)
+        return;
+    struct Conn {
+        media_source source;
+        media_destination destination;
+        char jackName[B_MEDIA_NAME_LENGTH];
+        int32 channel;
+        bool restore;
+        media_format format;
+    };
+    std::vector<Conn> conns;
+    {
+        BAutolock lock(gNode->fInputLock);
+        for (int32 i = 0; i < kMaxInputs; i++) {
+            const Input &in = gNode->fInputs[i];
+            if (!in.connected || in.port.load() != p)
+                continue;
+            Conn c;
+            c.source = in.input.source;
+            c.destination = in.input.destination;
+            strlcpy(c.jackName, in.input.name, sizeof c.jackName);
+            c.channel = in.channel.load();
+            c.restore = in.restoreToMixer;
+            c.format = in.restoreFormat;
+            conns.push_back(c);
+        }
+    }
+    for (size_t k = 0; k < conns.size(); k++) {
+        if (sourceName != NULL) {
+            char hardware[192], other[192];
+            input_source_names(roster, conns[k].source, conns[k].jackName, conns[k].channel,
+                               hardware, other, sizeof hardware);
+            if (strcmp(sourceName, hardware) != 0 && strcmp(sourceName, other) != 0)
+                continue;
+        }
+        media_node_id producer = node_for_port(roster, conns[k].source.port);
+        if (producer >= 0 &&
+            roster->Disconnect(producer, conns[k].source, gNode->ID(), conns[k].destination) ==
+                B_OK &&
+            conns[k].restore)
+            give_back_to_mixer(roster, conns[k].source, conns[k].format);
+    }
+}
+
+JdPort *mk_port_register(const char *shortName, int type, int direction)
+{
+    if (!gNode || !shortName)
+        return NULL;
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        Port &port = gNode->fPorts[p];
+        if (port.used.load(std::memory_order_acquire))
+            continue;
+        if (type == JD_PORT_MIDI) {
+            if (!port.midi)
+                port.midi = (MidiBuffer *)calloc(1, sizeof(MidiBuffer));
+            if (!port.midiRing)
+                port.midiRing = rt_ringbuffer_create(kMidiRingBytes);
+            if (!port.midi || !port.midiRing)
+                return NULL;
+            port.midi->count = 0;
+            // Nothing reads or writes the ring while the slot is free, so
+            // empty it as its reader.
+            rt_ringbuffer_read_advance(port.midiRing, rt_ringbuffer_read_space(port.midiRing));
+            // Room for the longest node name and the longest suffix.
+            char name[B_MEDIA_NAME_LENGTH + 32];
+            midi_endpoint_name(shortName, name, sizeof name);
+            BMidiEndpoint *endpoint;
+            if (direction & JD_PORT_INPUT) {
+                if (!port.midiIn)
+                    port.midiIn = new (std::nothrow) JdMidiIn(name, port.midiRing);
+                endpoint = port.midiIn;
+            } else {
+                if (!port.midiOut)
+                    port.midiOut = new (std::nothrow) BMidiLocalProducer(name);
+                endpoint = port.midiOut;
+            }
+            if (!endpoint)
+                return NULL;
+            endpoint->SetName(name);
+            if (endpoint->Register() != B_OK)
+                fprintf(stderr, "%s media: %s is not on the MIDI roster (midi_server?)\n",
+                        gNodeName, name);
+        } else {
+            if (!port.audio)
+                port.audio = (float *)calloc((size_t)gNode->MaxPeriod(), sizeof(float));
+            if (!port.audio)
+                return NULL;
+        }
+        port.type = type;
+        port.direction = (direction & JD_PORT_INPUT) ? JD_PORT_INPUT : JD_PORT_OUTPUT;
+        snprintf(port.shortName, sizeof port.shortName, "%s", shortName);
+        snprintf(port.fullName, sizeof port.fullName, "%s%s", gClientPrefix, shortName);
+        port.route.store(-1);
+        port.used.store(1, std::memory_order_release);
+
+        int32 j[2], c[2];
+        int32 n = type == JD_PORT_AUDIO && port.direction == JD_PORT_OUTPUT
+                      ? jacks_for_port(shortName, j, c)
+                      : 0;
+        for (int32 k = 0; k < n; k++) {
+            gNode->fJacks[j[k]].portSlot[c[k]].store(p, std::memory_order_release);
+            gNode->fJacks[j[k]].active.store(1, std::memory_order_release);
+        }
+        return (JdPort *)&port;
+    }
+    return NULL;
+}
+
+void mk_port_unregister(JdPort *jp)
+{
+    Port *port = (Port *)jp;
+    if (!gNode || !port)
+        return;
+    int32 j[2], c[2];
+    int32 n = port->type == JD_PORT_AUDIO && port->direction == JD_PORT_OUTPUT
+                  ? jacks_for_port(port->shortName, j, c)
+                  : 0;
+    for (int32 k = 0; k < n; k++) {
+        Jack &jk = gNode->fJacks[j[k]];
+        jk.portSlot[c[k]].store(-1, std::memory_order_release);
+        // Jack 0 (Master) and the Metronome stay listed; the others go away
+        // with their port.
+        bool any = false;
+        for (int32 ch = 0; ch < jk.channels; ch++)
+            any |= jk.portSlot[ch].load() >= 0;
+        if (!any && j[k] != 0 && j[k] != kMetronomeJack)
+            jk.active.store(0, std::memory_order_release);
+    }
+    if (port->type == JD_PORT_AUDIO && port->direction == JD_PORT_INPUT)
+        disconnect_port_inputs(int32(port - gNode->fPorts), NULL);
+    port->route.store(-1, std::memory_order_release);
+    if (port->type == JD_PORT_MIDI) {
+        midi_disconnect_all(*port);
+        if (port->direction == JD_PORT_INPUT && port->midiIn)
+            port->midiIn->Unregister();
+        else if (port->direction == JD_PORT_OUTPUT && port->midiOut)
+            port->midiOut->Unregister();
+    }
+    // The buffer stays: the cycle may be reading this slot right now.
+    port->used.store(0, std::memory_order_release);
+}
+
+const char *mk_port_name(JdPort *jp)
+{
+    return jp ? ((Port *)jp)->fullName : NULL;
+}
+
+jd_nframes_t mk_port_capture_latency(JdPort *jp)
+{
+    Port *port = (Port *)jp;
+    if (!gNode || !port)
+        return 0;
+    if (port->type == JD_PORT_MIDI) {
+        int32 frames = gNode->fMidiDelayFrames.load(std::memory_order_relaxed);
+        return port->direction == JD_PORT_INPUT && frames > 0 ? (jd_nframes_t)frames : 0;
+    }
+    // The largest of what it reads: its route and the connections on its jack.
+    int32 frames = 0;
+    int32 r = port->route.load(std::memory_order_acquire);
+    int32 i = (r >> 8) & 0xff;
+    if (r >= 0 && i < kMaxInputs)
+        frames = gNode->fInputs[i].latencyFrames.load(std::memory_order_relaxed);
+    int32 p = int32(port - gNode->fPorts);
+    for (int32 k = 0; k < kMaxInputs; k++) {
+        const Input &in = gNode->fInputs[k];
+        if (in.connected && in.port.load(std::memory_order_acquire) == p)
+            frames = std::max(frames, in.latencyFrames.load(std::memory_order_relaxed));
+    }
+    return frames > 0 ? (jd_nframes_t)frames : 0;
+}
+
+void *mk_port_buffer(JdPort *jp, jd_nframes_t nframes)
+{
+    (void)nframes; // always the period
+    Port *port = (Port *)jp;
+    return port->type == JD_PORT_MIDI ? (void *)port->midi : (void *)port->audio;
+}
+
+uint32_t mk_midi_event_count(void *buf)
+{
+    return buf ? ((MidiBuffer *)buf)->count : 0;
+}
+
+int mk_midi_event_get(JdMidiEvent *event, void *buf, uint32_t index)
+{
+    MidiBuffer *m = (MidiBuffer *)buf;
+    if (!m || index >= m->count)
+        return -1;
+    *event = m->events[index];
+    return 0;
+}
+
+void mk_midi_clear(void *buf)
+{
+    if (buf)
+        ((MidiBuffer *)buf)->count = 0;
+}
+
+int mk_midi_event_write(void *buf, jd_nframes_t time, const uint8_t *data, size_t size)
+{
+    MidiBuffer *m = (MidiBuffer *)buf;
+    if (!m || !data || size < 1 || size > 3 || m->count >= (uint32)kMidiMaxEvents)
+        return -1;
+    uint32 i = m->count++;
+    memcpy(m->data[i], data, size);
+    m->events[i].time = time;
+    m->events[i].size = size;
+    m->events[i].buffer = m->data[i];
+    return 0;
+}
+
+const char **make_name_list(const std::vector<CaptureSource> &srcs)
+{
+    if (srcs.empty())
+        return NULL;
+    size_t bytes = (srcs.size() + 1) * sizeof(char *);
+    for (size_t i = 0; i < srcs.size(); i++)
+        bytes += strlen(srcs[i].name) + 1;
+    char **list = (char **)malloc(bytes);
+    if (!list)
+        return NULL;
+    char *text = (char *)(list + srcs.size() + 1);
+    for (size_t i = 0; i < srcs.size(); i++) {
+        size_t len = strlen(srcs[i].name) + 1;
+        memcpy(text, srcs[i].name, len);
+        list[i] = text;
+        text += len;
+    }
+    list[srcs.size()] = NULL;
+    return (const char **)list;
+}
+
+/* Other endpoints on the MIDI roster: producers to take MIDI from (flags has
+ * JD_PORT_OUTPUT, as a JACK capture port), or consumers to send to. */
+const char **midi_get_ports(int flags)
+{
+    std::vector<CaptureSource> names; // only .name is used
+    bool producers = (flags & JD_PORT_OUTPUT) != 0;
+    int32 id = 0;
+    while (BMidiEndpoint *e = producers ? (BMidiEndpoint *)BMidiRoster::NextProducer(&id)
+                                        : (BMidiEndpoint *)BMidiRoster::NextConsumer(&id)) {
+        if (e->IsRemote()) {
+            CaptureSource s;
+            snprintf(s.name, sizeof s.name, "%s%s", kMidiPrefix, e->Name());
+            names.push_back(s);
+        }
+        e->Release();
+    }
+    return make_name_list(names);
+}
+
+const char **mk_get_ports(int type, int flags)
+{
+    if (!gNode)
+        return NULL;
+    if (type == JD_PORT_MIDI)
+        return midi_get_ports(flags);
+    if (type != JD_PORT_AUDIO)
+        return NULL;
+    if (!(flags & JD_PORT_OUTPUT)) {
+        // Playback: the mono jacks of the card that runs the clock, which
+        // the engine connects out_N to, as JACK's system:playback_N.
+        BMediaRoster *roster = BMediaRoster::CurrentRoster();
+        media_node card;
+        if (!roster || !playback_card(roster, &card))
+            return NULL;
+        std::vector<CaptureSource> names; // only .name is used
+        live_node_info info;
+        if (roster->GetLiveNodeInfo(card, &info) == B_OK) {
+            std::vector<media_input> ins;
+            playback_inputs(roster, card, ins);
+            for (size_t i = 0; i < ins.size(); i++) {
+                const media_raw_audio_format &a = ins[i].format.u.raw_audio;
+                if (a.frame_rate > 0 && fabsf(a.frame_rate - gNode->Rate()) > 0.5f)
+                    continue; // not at our rate (a card the clock is not on)
+                CaptureSource s;
+                playback_name(info.name, ins[i], s.name, sizeof s.name);
+                names.push_back(s);
+            }
+        }
+        roster->ReleaseNode(card);
+        return make_name_list(names);
+    }
+    std::vector<CaptureSource> srcs;
+    list_capture_sources(srcs);
+    return make_name_list(srcs);
+}
+
+void mk_free_ports(const char **ports)
+{
+    free((void *)ports);
+}
+
+bool is_midi_port(const char *name)
+{
+    Port *port = port_by_full_name(name);
+    return port && port->type == JD_PORT_MIDI;
+}
+
+/* MIDI connect/disconnect: one side is our port (by full name), the other an
+ * endpoint on the roster (by name). 0 = ok, EEXIST = already connected. */
+int midi_connect(const char *source, const char *destination, bool connect)
+{
+    Port *in = port_by_full_name(destination);
+    Port *out = port_by_full_name(source);
+    BMidiProducer *producer = NULL;
+    BMidiConsumer *consumer = NULL;
+    BMidiEndpoint *other = NULL;
+    if (in && in->type == JD_PORT_MIDI && in->direction == JD_PORT_INPUT && in->midiIn) {
+        other = find_remote_endpoint(source, true);
+        producer = (BMidiProducer *)other;
+        consumer = in->midiIn;
+    } else if (out && out->type == JD_PORT_MIDI && out->direction == JD_PORT_OUTPUT &&
+               out->midiOut) {
+        other = find_remote_endpoint(destination, false);
+        producer = out->midiOut;
+        consumer = (BMidiConsumer *)other;
+    }
+    if (!other) {
+        fprintf(stderr, "%s media: MIDI %s %s -> %s: no such endpoint\n", gNodeName,
+                connect ? "connect" : "disconnect", source ? source : "(null)",
+                destination ? destination : "(null)");
+        return -1;
+    }
+    int result = 0;
+    bool connected = producer->IsConnected(consumer);
+    if (connect && connected)
+        result = EEXIST;
+    else if (connect != connected &&
+             (connect ? producer->Connect(consumer) : producer->Disconnect(consumer)) != B_OK)
+        result = -1;
+    other->Release();
+    return result;
+}
+
+/* Connect an app's output that connect() took from the system mixer back to
+ * it. Non-RT. */
+void give_back_to_mixer(BMediaRoster *roster, const media_source &source,
+                        const media_format &format)
+{
+    media_node mixer;
+    if (roster->GetAudioMixer(&mixer) != B_OK)
+        return;
+    media_input in;
+    int32 n = 0;
+    if (roster->GetFreeInputsFor(mixer, &in, 1, &n, B_MEDIA_RAW_AUDIO) == B_OK && n == 1) {
+        media_format fmt = format;
+        media_output madeOut;
+        media_input madeIn;
+        status_t err = roster->Connect(source, in.destination, &fmt, &madeOut, &madeIn);
+        if (err != B_OK)
+            fprintf(stderr, "%s media: giving an output back to the system mixer: %s\n", gNodeName,
+                    strerror(err));
+    }
+    roster->ReleaseNode(mixer);
+}
+
+int mk_connect(const char *source, const char *destination)
+{
+    if (is_midi_port(source) || is_midi_port(destination))
+        return midi_connect(source, destination, true);
+    Port *output = port_by_full_name(source);
+    if (output && output->type == JD_PORT_AUDIO && output->direction == JD_PORT_OUTPUT)
+        return destination ? connect_playback(output, destination, true) : -1;
+    Port *port = port_by_full_name(destination);
+    if (!port || port->type != JD_PORT_AUDIO || port->direction != JD_PORT_INPUT) {
+        fprintf(stderr, "%s media: connect to %s: no such capture port\n", gNodeName,
+                destination ? destination : "(null)");
+        return -1;
+    }
+    int32 p = int32(port - gNode->fPorts);
+    std::vector<CaptureSource> srcs;
+    list_capture_sources(srcs);
+    const CaptureSource *s = NULL;
+    for (size_t i = 0; i < srcs.size() && !s; i++)
+        if (strcmp(srcs[i].name, source) == 0)
+            s = &srcs[i];
+    if (!s) {
+        fprintf(stderr, "%s media: connect %s: no such capture source\n", gNodeName, source);
+        return -1;
+    }
+
+    {
+        // Already wired to this port's jack: only the channel is chosen.
+        BAutolock lock(gNode->fInputLock);
+        for (int32 i = 0; i < kMaxInputs; i++) {
+            Input &in = gNode->fInputs[i];
+            if (!in.connected || in.port.load() != p)
+                continue;
+            if (s->input >= 0 ? i == s->input : in.input.source == s->output.source) {
+                if (s->channel >= in.channels)
+                    return -1;
+                in.channel.store(s->channel, std::memory_order_relaxed);
+                in.whole.store(false, std::memory_order_relaxed);
+                port->route.store(-1, std::memory_order_release);
+                return 0;
+            }
+        }
+    }
+
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (!roster)
+        return -1;
+
+    // A connection of its own on this port's jack, as JACK makes: from that
+    // output or, when it is in use (on another of our ports, or elsewhere),
+    // from another output of the same name that the node offers for each
+    // connection (multi_audio's jacks do).
+    media_output out = s->output;
+    bool own = s->input < 0;
+    if (own && out.destination != media_destination::null) {
+        own = false;
+        std::vector<media_output> frees(64);
+        int32 n = 0;
+        if (roster->GetFreeOutputsFor(s->node, frees.data(), (int32)frees.size(), &n,
+                                      B_MEDIA_RAW_AUDIO) == B_OK) {
+            for (int32 o = 0; o < n && o < (int32)frees.size() && !own; o++) {
+                if (strncmp(frees[o].name, out.name, B_MEDIA_NAME_LENGTH) == 0) {
+                    out = frees[o];
+                    own = true;
+                }
+            }
+        }
+    }
+    bool restoreToMixer = false;
+    bool ours;
+    {
+        BAutolock lock(gNode->fInputLock);
+        ours = find_input_from(s->output.source) >= 0;
+    }
+    if (!own && s->app && s->input < 0 && !ours) {
+        // An app's output goes to one place at a time: take it from where it
+        // goes (the system mixer, normally) to this port. Undoing the
+        // connection gives it back to the mixer.
+        media_node_id consumer = node_for_port(roster, out.destination.port);
+        media_node mixer;
+        if (roster->GetAudioMixer(&mixer) == B_OK) {
+            restoreToMixer = consumer == mixer.node;
+            roster->ReleaseNode(mixer);
+        }
+        if (consumer >= 0 &&
+            roster->Disconnect(s->node.node, out.source, consumer, out.destination) == B_OK) {
+            out.destination = media_destination::null;
+            own = true;
+        } else {
+            restoreToMixer = false;
+        }
+    }
+    if (!own) {
+        // It comes in already and cannot come in again (an output a node
+        // offers once, or a connection from a node that is not hardware):
+        // the port reads its channel where it comes in.
+        BAutolock lock(gNode->fInputLock);
+        int32 input = s->input >= 0 ? s->input : find_input_from(s->output.source);
+        if (input < 0 || !gNode->fInputs[input].connected ||
+            s->channel >= gNode->fInputs[input].channels) {
+            fprintf(stderr, "%s media: connect %s: that output is connected elsewhere\n", gNodeName,
+                    source);
+            return -1;
+        }
+        port->route.store(((int32)gNode->fInputs[input].generation << 16) | (input << 8) |
+                              s->channel,
+                          std::memory_order_release);
+        return 0;
+    }
+
+    // All its channels (a stereo app stays stereo, so its right side can
+    // feed in_NR); the port takes the one chosen.
+    media_format fmt;
+    fmt.type = B_MEDIA_RAW_AUDIO;
+    fmt.u.raw_audio = media_raw_audio_format::wildcard;
+    uint32 channels = s->output.format.u.raw_audio.channel_count;
+    if (channels > 0 && channels <= (uint32)kMaxInChannels)
+        fmt.u.raw_audio.channel_count = channels;
+    if (s->app) {
+        // An app keeps the format it had (MediaPlayer: the file's rate, 40 ms
+        // buffers) and we convert it, as the system mixer does. Left to us,
+        // it would convert to our rate itself and send a buffer per period,
+        // and MediaPlayer cannot read its file that fast at 1 ms: most of
+        // what it sent was silence.
+        const media_raw_audio_format &had = s->output.format.u.raw_audio;
+        const media_raw_audio_format &w = media_raw_audio_format::wildcard;
+        if (had.frame_rate != w.frame_rate)
+            fmt.u.raw_audio.frame_rate = had.frame_rate;
+        if (had.format != w.format)
+            fmt.u.raw_audio.format = had.format;
+        if (had.buffer_size != w.buffer_size)
+            fmt.u.raw_audio.buffer_size = had.buffer_size;
+    }
+    media_output madeOut;
+    media_input madeIn;
+    media_destination jack(gNode->ControlPort(), kFreeJackBase + p);
+    status_t err = roster->Connect(out.source, jack, &fmt, &madeOut, &madeIn);
+    if (err != B_OK) {
+        fprintf(stderr, "%s media: connecting %s to %s failed: %s\n", gNodeName, source,
+                destination, strerror(err));
+        if (restoreToMixer)
+            give_back_to_mixer(roster, out.source, s->output.format);
+        return -1;
+    }
+    BAutolock lock(gNode->fInputLock);
+    int32 input = find_input_from(madeOut.source);
+    if (input < 0)
+        return -1;
+    Input &in = gNode->fInputs[input];
+    in.madeByUs = true;
+    in.producerNode = s->node;
+    if (s->channel < in.channels)
+        in.channel.store(s->channel, std::memory_order_relaxed);
+    in.whole.store(false, std::memory_order_relaxed);
+    in.restoreToMixer = restoreToMixer;
+    in.restoreFormat = s->output.format;
+    port->route.store(-1, std::memory_order_release);
+    return 0;
+}
+
+int mk_disconnect(const char *source, const char *destination)
+{
+    if (is_midi_port(source) || is_midi_port(destination))
+        return midi_connect(source, destination, false) == -1 ? -1 : 0;
+    Port *output = port_by_full_name(source);
+    if (output && output->type == JD_PORT_AUDIO && output->direction == JD_PORT_OUTPUT)
+        return destination ? connect_playback(output, destination, false) : -1;
+    Port *port = port_by_full_name(destination);
+    if (!port || port->direction != JD_PORT_INPUT)
+        return -1;
+
+    // The connections made on this port's jack that carry it, whoever made
+    // them, as jack_disconnect does.
+    disconnect_port_inputs(int32(port - gNode->fPorts), source);
+
+    // A port that reads a channel where it comes in (see mk_connect).
+    int32 r = port->route.exchange(-1, std::memory_order_acq_rel);
+    if (r < 0)
+        return 0;
+    int32 input = (r >> 8) & 0xff;
+    if (input >= kMaxInputs)
+        return 0;
+
+    // Undo a connection we made once no capture port reads it any more.
+    bool stillUsed = false;
+    for (int32 p = 0; p < kMaxPorts && !stillUsed; p++) {
+        Port &o = gNode->fPorts[p];
+        int32 rr = o.route.load(std::memory_order_acquire);
+        stillUsed = o.used.load() && rr >= 0 && ((rr >> 8) & 0xff) == input;
+    }
+    media_source src;
+    media_destination dst;
+    media_node producer;
+    {
+        BAutolock lock(gNode->fInputLock);
+        Input &in = gNode->fInputs[input];
+        // One made on a jack still feeds that jack's port.
+        if (stillUsed || !in.connected || !in.madeByUs || in.port.load() >= 0)
+            return 0;
+        src = in.input.source;
+        dst = in.input.destination;
+        producer = in.producerNode;
+    }
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (roster)
+        roster->Disconnect(producer.node, src, gNode->ID(), dst);
+    return 0;
+}
+
+int mk_create_rt_thread(pthread_t *thread, void *(*fn)(void *), void *arg)
+{
+    if (pthread_create(thread, NULL, fn, arg) != 0)
+        return -1;
+    // The same priority as the node's control thread, which runs the cycle.
+    set_thread_priority(get_pthread_thread_id(*thread), B_URGENT_PRIORITY);
+    return 0;
+}
+
+void mk_hold_latency(int hold)
+{
+    gHoldLatency.store(hold ? 1 : 0, std::memory_order_relaxed);
+}
+
+const JdBackend kMediaKitBackend = {
+    JD_BACKEND_ABI,
+    "Media Kit",
+    mk_open,
+    mk_activate,
+    mk_close,
+    mk_sample_rate,
+    mk_buffer_size,
+    mk_port_register,
+    mk_port_unregister,
+    mk_port_name,
+    mk_port_capture_latency,
+    mk_port_buffer,
+    mk_midi_event_count,
+    mk_midi_event_get,
+    mk_midi_clear,
+    mk_midi_event_write,
+    mk_get_ports,
+    mk_free_ports,
+    mk_connect,
+    mk_disconnect,
+    mk_create_rt_thread,
+    mk_hold_latency,
+};
+
+} // namespace
+
+extern "C" const JdBackend *jackdaw_mediakit_backend_entry(uint32_t abi)
+{
+    return abi == JD_BACKEND_ABI ? &kMediaKitBackend : NULL;
+}
+
+extern "C" void jackdaw_mediakit_set_node_name(const char *name)
+{
+    if (gNode || !name || !*name)
+        return;
+    snprintf(gNodeName, sizeof gNodeName, "%s", name);
+}

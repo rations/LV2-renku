@@ -1,7 +1,12 @@
 /*
- * lv2host_core — shared LV2 hosting core for the Haiku hosts: a stereo JACK
+ * lv2host_core — shared LV2 hosting core for the RenkuOS hosts: a stereo audio
  * client that discovers, instantiates and runs one LV2 plugin (dual-mono for
  * 1-in/1-out plugins).
+ *
+ * Audio goes through Kasen's audio backends (jdbackend/, see its PROVENANCE):
+ * the RenkuOS Media Kit (one media node, the default) or JACK (an add-on,
+ * jack.so, so nothing here links libjack). The Media Kit backend needs a
+ * BApplication: create it before lv2host_open.
  *
  * Hosting behavior (feature allow-list, connect-every-port-before-run,
  * per-run atom reset, worker threads fed through lock-free rings) mirrors
@@ -9,7 +14,8 @@
  *
  * Threading classes:
  *  - opening thread: discovery, instantiation, teardown (non-RT);
- *  - JACK process callback: RT — no allocation, locks, I/O, or logging;
+ *  - the backend's process callback: RT — no allocation, locks, I/O, or
+ *    logging;
  *  - one non-RT worker thread per plugin instance (worker extension);
  *  - any control-writer thread (REPL, GUI looper): lv2host_set_param() /
  *    lv2host_write_control_port() marshal through a pre-allocated lock-free
@@ -28,9 +34,10 @@
 #include <zix/sem.h>
 #include <zix/thread.h>
 
-#include <jack/jack.h>
+#include "engine/audio_backend.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -111,25 +118,71 @@ typedef struct {
 
     ZixRing *ctl_ring; /* control writes from non-RT threads to RT */
 
-    jack_client_t *client;
-    jack_port_t *jin[2], *jout[2];
+    const JdBackend *be;      /* NULL until opened */
+    JdPort *pin[2], *pout[2]; /* in_1/in_2, out_1/out_2 */
     double sample_rate;
     volatile int block_too_big; /* flagged from RT if nframes > max_block */
-    volatile unsigned n_xruns;  /* incremented from JACK's xrun callback */
+    volatile unsigned n_xruns;  /* incremented from the backend's xrun callback */
+    volatile int backend_gone;  /* the audio system shut the client down */
+    volatile int passthrough;   /* 0: outputs silent (a tuner); 1 by default */
+    char error[256];            /* why lv2host_open failed, for the user */
 } Lv2Host;
 
-/* Load the lilv world, resolve plugin_uri, reject unsupported required
-   features, open a stereo JACK client, instantiate + activate the plugin
-   with every port connected, and start processing. Non-RT. On failure the
-   host is torn down and false is returned. */
-bool lv2host_open(Lv2Host *h, const char *plugin_uri, const char *client_name);
+/* How lv2host_open reaches the audio system. */
+typedef struct {
+    /* "mediakit" (the default, also for NULL) or "jack". */
+    const char *backend;
+    /* Names the JACK add-on folder (add-ons/<addon_name>/jack.so) and is used
+     * in messages; NULL = the client name. */
+    const char *addon_name;
+    /* Environment variable naming a folder with jack.so, for a build tree;
+     * NULL = none. */
+    const char *backend_dir_env;
+} Lv2hOpenOptions;
 
-/* Deactivate, close the JACK client (never skip this — a killed client
-   leaves the server graph wedged), stop workers, free everything. Non-RT. */
+/* Load the lilv world, resolve plugin_uri, reject unsupported required
+   features, open a stereo audio client named client_name on the backend
+   opt chooses (NULL = Media Kit defaults), instantiate + activate the plugin
+   with every port connected, and start processing. On the Media Kit the
+   node is named client_name. Non-RT. On failure the host is torn down,
+   h->error says why, and false is returned. */
+bool lv2host_open(Lv2Host *h, const char *plugin_uri, const char *client_name,
+                  const Lv2hOpenOptions *opt);
+
+/* Deactivate, close the audio client (never skip this — a killed JACK client
+   leaves the server graph wedged, and a Media Kit node stays registered),
+   stop workers, free everything. Non-RT. */
 void lv2host_close(Lv2Host *h);
 
-/* Best effort: wire our stereo ports to the physical capture/playback. */
+/* Best effort: wire our stereo ports to the physical capture/playback. The
+   inputs come from the card that runs the clock when it has capture jacks
+   (on the Media Kit), else from the first capture jacks. */
 void lv2host_autoconnect(Lv2Host *h);
+
+/* Best effort: only out_1/out_2 to the physical playback. */
+void lv2host_connect_outputs(Lv2Host *h);
+
+/* The capture jack lv2host_autoconnect would connect to in_1, written to
+   out; false (out "") if there is none. Non-RT. */
+bool lv2host_default_source(Lv2Host *h, char *out, size_t len);
+
+/* The audio sources in_1/in_2 can be connected from (hardware capture
+   first; on the Media Kit also other programs' outputs), NULL-terminated,
+   or NULL if none. Free with lv2host_free_sources. Non-RT. */
+const char **lv2host_get_sources(Lv2Host *h);
+void lv2host_free_sources(Lv2Host *h, const char **sources);
+
+/* Connect / disconnect `source` (a name from lv2host_get_sources) to input
+   `input` (0 = in_1, 1 = in_2). 0 = ok. Non-RT. */
+int lv2host_connect_input(Lv2Host *h, const char *source, int input);
+int lv2host_disconnect_input(Lv2Host *h, const char *source, int input);
+
+/* Whether the plugin's output is heard (default on). Any thread. */
+void lv2host_set_passthrough(Lv2Host *h, bool on);
+
+/* The backend's name ("Media Kit", "JACK") and current period in frames. */
+const char *lv2host_backend_name(const Lv2Host *h);
+uint32_t lv2host_period(const Lv2Host *h);
 
 /* Clamp val to params[param_idx]'s range and enqueue it for the RT thread.
    Callable from any non-RT thread. Returns false on bad index / full ring. */

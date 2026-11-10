@@ -1,0 +1,12 @@
+These files are copied unchanged from Kasen, MIT licence (see LICENSE here),
+by tools/sync-jdbackend.sh. Do not edit them in this repository: change them
+in Kasen and sync again.
+
+Source:  https://github.com/rations/kasen
+Commit:  6d3d6e3ad1119faad9e3c4490e04461054e93a54
+Files:   src/backend/mediakit/mediakit_backend.cpp -> backend/mediakit/
+         src/backend/jack/jack_backend.c           -> backend/jack/
+         src/engine/audio_backend.h                -> engine/
+         src/engine/audio_backend.c                -> engine/
+         src/engine/rt_ringbuffer.h                -> engine/
+         src/engine/rt_ringbuffer.c                -> engine/

@@ -1,8 +1,10 @@
 # LV2-renku
 
-> This repository is the source of the `lv2_haiku` package, part of the
-> [JackDAW stack](https://github.com/rations/jackDAW-renku) for RenkuOS. The 0.5
-> release's `install.sh` is for Haiku hrev60256; there is no RenkuOS release yet.
+> This repository is the source of the RenkuOS package `lv2_renku`: the LV2
+> specification bundles every LV2 host needs at runtime, the hosts `lv2host` and
+> `lv2guihost`, the lilv tools and the hkamp example plug-in. It replaces the old
+> `lv2_haiku` package. [Kasen](https://github.com/rations/kasen), the RenkuOS DAW, and
+> [rktuner](https://github.com/rations/rktuner) require it.
 
 Native port of the **LV2 plugin hosting stack** to **RenkuOS** (a Haiku fork).
 
@@ -11,9 +13,18 @@ This repo vendors the upstream drobilla suite pristine under `lv2stack/` — the
 sratom 0.6.22, and lilv 0.28.0 — and builds it natively as static libraries with each
 project's own unmodified meson build. On top of that it adds:
 
-- **`hosts/lv2jackhost`** — a headless JACK host with a stdin parameter REPL, for running
-  and validating LV2 plugins live on RenkuOS hardware.
-- **`hosts/lv2guihost`** — a native Interface Kit test host for LV2 plugin GUIs.
+- **`hosts/lv2host`** — a headless host with a stdin prompt for parameters and inputs,
+  for running and validating LV2 plug-ins live on RenkuOS hardware:
+  `lv2host [--backend mediakit|jack] <plugin-uri>`.
+- **`hosts/lv2guihost`** — the same with the plug-in's own UI (HaikuUI or
+  `ui:showInterface`).
+
+  Both play through the RenkuOS Media Kit by default: one media node, patched in Cortex,
+  whose inputs are connected from the sound card that runs the clock. With JACK installed,
+  `--backend jack` runs them as a JACK client instead. The audio backends are Kasen's,
+  copied unchanged into `jdbackend/` by `tools/sync-jdbackend.sh`; JACK support is the
+  `jack.so` add-on (`add-ons/lv2host/`), so the hosts never link libjack. The hosting core
+  and UI host are also staged as `liblv2host.a` for apps built on this stack (rktuner).
 - **`ns/ui-haiku.lv2`** — a small LV2 extension bundle defining the **HaikuUI** UI type:
   a plugin UI whose `LV2UI_Widget` is a native `BView*`, exactly parallel to the spec's
   CocoaUI (`NSView*`). Plugins built for RenkuOS can ship native Interface Kit editors;
