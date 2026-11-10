@@ -8,11 +8,11 @@
 # this again. VST3-renku keeps its copy the same way.
 #
 # usage: tools/sync-jdbackend.sh [path to a Kasen checkout]
-#        (default: ../jackDAW-haiku next to this repo)
+#        (default: ../kasen next to this repo)
 set -e
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-SRC=${1:-"$ROOT/../jackDAW-haiku"}
+SRC=${1:-"$ROOT/../kasen"}
 DEST="$ROOT/jdbackend"
 
 [ -f "$SRC/src/backend/mediakit/mediakit_backend.cpp" ] ||

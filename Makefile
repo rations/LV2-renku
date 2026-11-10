@@ -15,8 +15,8 @@
 #   build/stage/develop/headers/lv2host/  their headers
 #
 # Typical loop from the dev host:
-#   rsync -a --delete --exclude build --exclude .git ./ haikulaptop:LV2-haiku/
-#   ssh haikulaptop 'cd LV2-haiku && make'
+#   rsync -a --delete --exclude build --exclude .git ./ haikulaptop:LV2-renku/
+#   ssh haikulaptop 'cd LV2-renku && make'
 
 BUILD_DIR ?= build
 STAGE := $(abspath $(BUILD_DIR)/stage)
@@ -56,7 +56,7 @@ UNAME := $(shell uname)
 # the sibling JACK2 port tree (the exact source of the installed libjack),
 # else the non-packaged or system headers. Without them there is no add-on
 # and the hosts run on the Media Kit only.
-JACK_PORT_DIR ?= $(HOME)/jack-port-haiku
+JACK_PORT_DIR ?= $(HOME)/jack-port-renku
 JACK_INC ?= $(firstword $(foreach d,$(JACK_PORT_DIR)/common /boot/system/non-packaged/include \
 	/boot/system/develop/headers,$(if $(wildcard $(d)/jack/jack.h),$(d))))
 JACK_CFLAGS ?= $(if $(JACK_INC),-I$(JACK_INC))
